@@ -38,6 +38,9 @@ class StreamClient(
     /** Invoked when the server confirms the stream codec (true = HEVC). */
     var onCodecSelected: ((Boolean) -> Unit)? = null
 
+    /** Invoked when the host display power state changes (true = sleeping). */
+    var onHostDisplayPower: ((Boolean) -> Unit)? = null
+
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
         private set
@@ -128,6 +131,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseFrameMetadataSupport()
+                advertiseDisplayPowerSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
                 synchronized(keyframeRequestLock) {
@@ -256,6 +260,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseFrameMetadataSupport()
+                advertiseDisplayPowerSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
                 onConnectionStatus?.invoke(true)
@@ -292,6 +297,15 @@ class StreamClient(
             out.writeByte(MESSAGE_CLIENT_AVC_ONLY)
             out.flush()
             diagLog("Advertised AVC-only (no HEVC decoder on this device)")
+        }
+    }
+
+    /** Exactly 1 byte (type 11). Old Mac hosts log+drop 1 byte and stay aligned. */
+    private fun advertiseDisplayPowerSupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_DISPLAY_POWER)
+            out.flush()
+            diagLog("Advertised display power support")
         }
     }
 
@@ -334,6 +348,12 @@ class StreamClient(
                             codecNegotiated = true
                             diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
                             onCodecSelected?.invoke(streamCodecIsHevc)
+                        }
+
+                        MESSAGE_HOST_DISPLAY_POWER -> {
+                            val sleeping = input.readByte().toInt() != 0
+                            diagLog("Host display power: sleeping=$sleeping")
+                            onHostDisplayPower?.invoke(sleeping)
                         }
 
                         else -> {
@@ -581,6 +601,10 @@ class StreamClient(
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
+        /** Client→server opt-in, single byte only. */
+        private const val MESSAGE_CLIENT_SUPPORTS_DISPLAY_POWER = 11
+        /** Server→client, 1-byte payload: 1=sleeping, 0=awake. */
+        private const val MESSAGE_HOST_DISPLAY_POWER = 12
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

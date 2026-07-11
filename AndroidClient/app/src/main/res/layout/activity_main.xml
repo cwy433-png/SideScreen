@@ -147,6 +147,25 @@
             android:tint="#FFFFFF" />
     </androidx.cardview.widget.CardView>
 
+    <!-- Privacy blackout when host display is sleeping.
+         Declared after statusBar/settingsButton (elevation 8dp) and uses
+         elevation 16dp so it covers video + those chrome views, but stays
+         below settingsPanel (24dp) so the connection panel remains visible
+         after disconnect. -->
+    <View
+        android:id="@+id/privacyOverlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#FF000000"
+        android:clickable="true"
+        android:focusable="true"
+        android:elevation="16dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
     <!-- Modern Connection Panel -->
     <androidx.cardview.widget.CardView
         android:id="@+id/settingsPanel"

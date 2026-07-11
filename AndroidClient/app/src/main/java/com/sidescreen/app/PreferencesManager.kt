@@ -40,4 +40,9 @@ class PreferencesManager(
     var connectionMode: ConnectionMode
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
+
+    /** When true, release FLAG_KEEP_SCREEN_ON while host display is sleeping. Default off. */
+    var allowScreenOffOnHostSleep: Boolean
+        get() = prefs.getBoolean("allow_screen_off_on_host_sleep", false)
+        set(value) = prefs.edit().putBoolean("allow_screen_off_on_host_sleep", value).apply()
 }

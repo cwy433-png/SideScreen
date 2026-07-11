@@ -67,6 +67,9 @@ class MainActivity : AppCompatActivity() {
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
 
+    /** Tracks host-display privacy overlay state for idempotent setPrivacyMode. */
+    private var privacyModeActive = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -479,6 +482,7 @@ class MainActivity : AppCompatActivity() {
 
         val view = dialog.findViewById<View>(android.R.id.content)
         val showStatsSwitch = view.findViewById<SwitchMaterial>(R.id.showStatsSwitch)
+        val allowScreenOffSwitch = view.findViewById<SwitchMaterial>(R.id.allowScreenOffOnHostSleepSwitch)
         val opacitySlider = view.findViewById<Slider>(R.id.opacitySlider)
         val opacityValue = view.findViewById<TextView>(R.id.opacityValue)
         val resetButton = view.findViewById<View>(R.id.resetPositionButton)
@@ -502,6 +506,7 @@ class MainActivity : AppCompatActivity() {
 
         // Load current settings
         showStatsSwitch.isChecked = prefs.showStatsOverlay
+        allowScreenOffSwitch.isChecked = prefs.allowScreenOffOnHostSleep
         opacitySlider.value = prefs.overlayOpacity
         opacityValue.text = "${(prefs.overlayOpacity * 100).toInt()}%"
 
@@ -536,6 +541,18 @@ class MainActivity : AppCompatActivity() {
         showStatsSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.showStatsOverlay = isChecked
             updateOverlayVisibility(isChecked)
+        }
+
+        allowScreenOffSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.allowScreenOffOnHostSleep = isChecked
+            // Re-apply flag while already in privacy mode without flipping overlay.
+            if (privacyModeActive) {
+                if (isChecked) {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
         }
 
         opacitySlider.addOnChangeListener { _, value, _ ->
@@ -827,6 +844,7 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
+     * USB path must also call this — do not re-inline callbacks there.
      */
     private fun setupStreamClientCallbacks() {
         streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
@@ -834,6 +852,7 @@ class MainActivity : AppCompatActivity() {
             if (dec != null) {
                 dec.decode(frameData, frameSize, timestamp, isKeyframe)
             } else {
+                streamClient?.releaseBuffer(frameData)
                 mainDiag("FRAME DROPPED: videoDecoder is null!")
             }
         }
@@ -842,9 +861,19 @@ class MainActivity : AppCompatActivity() {
             streamClient?.releaseBuffer(buffer)
         }
 
+        videoDecoder?.onKeyframeRequired = { force, reason ->
+            streamClient?.requestKeyframe(force = force, reason = reason)
+        }
+
         streamClient?.onLatencyMeasured = { rttMs ->
             runOnUiThread {
                 binding.latencyText.text = String.format("%.1f ms", rttMs)
+            }
+        }
+
+        streamClient?.onHostDisplayPower = { sleeping ->
+            runOnUiThread {
+                setPrivacyMode(sleeping)
             }
         }
 
@@ -881,6 +910,9 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
                 } else {
+                    // Hide privacy overlay and restore KEEP_SCREEN_ON so
+                    // "allow screen off" mode cannot leave the tablet dimmed.
+                    setPrivacyMode(false)
                     stopPingTimer()
                     disableFullscreenMode()
                     resetOrientationToSensor()
@@ -941,6 +973,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Single entry for host-display privacy mode. Idempotent: repeating the
+     * same sleeping value has no side effects (fast sleep/wake loops stay clean).
+     *
+     * sleeping=true  → show black overlay; optionally release KEEP_SCREEN_ON
+     * sleeping=false → hide overlay; restore KEEP_SCREEN_ON; try turnScreenOn
+     */
+    private fun setPrivacyMode(sleeping: Boolean) {
+        if (privacyModeActive == sleeping) return
+        privacyModeActive = sleeping
+        if (sleeping) {
+            binding.privacyOverlay.visibility = View.VISIBLE
+            if (prefs.allowScreenOffOnHostSleep) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            // Clear sticky turn-screen-on so a later Activity resume does not
+            // unexpectedly relight the display after host sleep.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setTurnScreenOn(false)
+            }
+            mainDiag("Privacy mode ON (allowScreenOff=${prefs.allowScreenOffOnHostSleep})")
+        } else {
+            binding.privacyOverlay.visibility = View.GONE
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setTurnScreenOn(true)
+            }
+            mainDiag("Privacy mode OFF")
+        }
+    }
+
     private fun connectWireless(
         host: String,
         port: Int,
@@ -978,132 +1041,9 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
-
-                streamClient = StreamClient(host, port)
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    val dec = videoDecoder
-                    if (dec != null) {
-                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                    } else {
-                        streamClient?.releaseBuffer(frameData)
-                    }
-                }
-
-                // Wire up buffer release callback for buffer pooling
-                // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
-                }
-                videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
-                }
-
-                // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
-                    runOnUiThread {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
-                    }
-                }
-
-                streamClient?.onConnectionStatus = { connected ->
-                    runOnUiThread {
-                        // Update connection state flag
-                        isConnected = connected
-
-                        if (connected) {
-                            updateStatus("Connected - Streaming active")
-                        } else {
-                            updateStatus("Disconnected")
-                        }
-
-                        binding.connectButton.isEnabled = !connected
-                        binding.disconnectButton.isEnabled = connected
-
-                        // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
-                            if (connected) {
-                                android.R.color.holo_green_light
-                            } else {
-                                android.R.color.holo_red_light
-                            },
-                        )
-
-                        if (connected) {
-                            // Start periodic ping for latency measurement
-                            startPingTimer()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
-                            stopChecklistUpdates()
-
-                            // Enter fullscreen mode when connected
-                            enableFullscreenMode()
-
-                            binding.settingsPanel.visibility = View.GONE
-                            binding.settingsButton.visibility = View.VISIBLE
-                            restoreSettingsButtonPosition()
-                            updateOverlayVisibility(prefs.showStatsOverlay)
-                        } else {
-                            // Stop ping timer
-                            stopPingTimer()
-
-                            // Exit fullscreen mode when disconnected
-                            disableFullscreenMode()
-
-                            // Reset to follow device sensor when disconnected
-                            resetOrientationToSensor()
-
-                            binding.settingsPanel.visibility = View.VISIBLE
-                            binding.settingsButton.visibility = View.GONE
-                            binding.statusBar.visibility = View.GONE
-
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
-                            startChecklistUpdates()
-                        }
-                    }
-                }
-
-                streamClient?.onDisplaySize = { width, height, rotation ->
-                    mainDiag("onDisplaySize: ${width}x$height @ $rotation°")
-                    warnIfAvcOnlyWithoutNegotiation()
-                    displayWidth = width
-                    displayHeight = height
-                    displayRotation = rotation
-
-                    if (videoDecoder != null) {
-                        // Decoder already exists — update its resolution
-                        videoDecoder?.updateResolution(width, height)
-                    } else {
-                        // Decoder not yet created — create it now with correct resolution
-                        val holder = currentSurfaceHolder
-                        if (holder != null && holder.surface.isValid) {
-                            mainDiag("Display config arrived, initializing decoder ${width}x$height")
-                            runOnUiThread {
-                                // Re-check under UI thread to prevent race with surfaceChanged
-                                if (videoDecoder == null) {
-                                    initializeDecoder(holder)
-                                }
-                            }
-                        } else {
-                            mainDiag("Display config arrived but no valid surface yet")
-                        }
-                    }
-
-                    runOnUiThread {
-                        binding.resolutionText.text = "${width}x$height"
-                        // Apply rotation to SurfaceView
-                        applyRotation(rotation)
-                    }
-                    log("Display: ${width}x$height @ $rotation°")
-                }
-
-                streamClient?.onStats = { fps, mbps ->
-                    runOnUiThread {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
-                    }
-                }
-
+                // Shared callback path with wireless — includes onHostDisplayPower.
+                streamClient = StreamClient(host, port, applicationContext)
+                setupStreamClientCallbacks()
                 streamClient?.connect()
             } catch (e: Exception) {
                 val errorMessage =
