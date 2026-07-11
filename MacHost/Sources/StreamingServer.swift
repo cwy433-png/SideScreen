@@ -17,6 +17,14 @@ private enum WireMessage {
     /// clients that sent clientAvcOnly — old clients disconnect on unknown
     /// message types, so this must never be sent unsolicited.
     static let codecSelected: UInt8 = 10
+    /// Client→server opt-in, payload-free (exactly 1 byte). Old hosts log and
+    /// drop 1 byte for unknown types, so a single-byte message keeps the
+    /// stream aligned when a new client talks to an old Mac.
+    static let clientSupportsDisplayPower: UInt8 = 11
+    /// Server→client, 1-byte payload: 1 = host display sleeping, 0 = awake.
+    /// Sent ONLY to clients that sent clientSupportsDisplayPower — old Android
+    /// clients disconnect on unknown types.
+    static let hostDisplayPower: UInt8 = 12
 }
 
 private extension NWEndpoint {
@@ -76,6 +84,11 @@ class StreamingServer {
     private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
+    /// Set when client sends type 11. Gates all type 12 sends.
+    private var clientSupportsDisplayPower = false
+    /// Cached host display power state. Updated independently of whether a
+    /// client is connected or has opted in; send path reads this cache.
+    private var displaySleeping = false
     private var inputBuffer = Data()
 
     init(port: UInt16) {
@@ -128,6 +141,10 @@ class StreamingServer {
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
+        clientSupportsDisplayPower = false
+        // displaySleeping is host state — intentionally not reset on reconnect
+        // so a client that reconnects while the display is still asleep gets
+        // the correct state on opt-in / connectionReady.
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
@@ -199,7 +216,10 @@ class StreamingServer {
         debugLog("Client connected - sending display config first")
         sendDisplaySize()
         connectionReady = true
-        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec))")
+        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec), displayPower=\(clientSupportsDisplayPower ? "on" : "off"))")
+        // Sync current true/false display power after ready — independent of
+        // whether type 11 arrived before or after this point.
+        sendCachedDisplayPowerState()
         onClientConnected?()
     }
 
@@ -294,6 +314,47 @@ class StreamingServer {
 
         connection.send(content: data, completion: .contentProcessed { _ in })
         debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°")
+    }
+
+    /// Cache the host display power state. Does not send on the wire.
+    /// Async-dispatched to `networkQueue` so `displaySleeping` is only
+    /// mutated on the same serial queue as capability / connectionReady /
+    /// sendCached.
+    func updateDisplayPowerState(sleeping: Bool) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.displaySleeping = sleeping
+            debugLog("Cached displaySleeping=\(sleeping)")
+        }
+    }
+
+    /// Combined entry used by ScreenCapture wiring (main queue): update
+    /// cache, then attempt send. Always hops async onto `networkQueue` so
+    /// cache + send gates stay serialized with capability/connectionReady
+    /// handling. Never uses sync (would deadlock if already on networkQueue).
+    func sendDisplayPowerState(sleeping: Bool) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.displaySleeping = sleeping
+            debugLog("Cached displaySleeping=\(sleeping)")
+            self.sendCachedDisplayPowerState()
+        }
+    }
+
+    /// Send the current cached true/false display power state.
+    /// Silent no-op unless the client opted in (type 11) and connectionReady.
+    /// Never sends type 12 to clients that did not opt in.
+    ///
+    /// Must be invoked only on `networkQueue` (capability opt-in and
+    /// finishProtocolStartup already run there). Do not wrap this body in
+    /// networkQueue.sync — that self-deadlocks.
+    func sendCachedDisplayPowerState() {
+        guard clientSupportsDisplayPower, connectionReady, !isStopped else { return }
+        guard let connection = connection else { return }
+
+        let msg = Data([WireMessage.hostDisplayPower, displaySleeping ? 1 : 0])
+        connection.send(content: msg, completion: .contentProcessed { _ in })
+        debugLog("Sent hostDisplayPower sleeping=\(displaySleeping)")
     }
 
     private func startReceivingTouch() {
@@ -403,6 +464,19 @@ class StreamingServer {
                     clientIsAvcOnly = true
                     debugLog("Client is AVC-only — will negotiate H.264")
                 }
+
+            case WireMessage.clientSupportsDisplayPower:
+                // Exactly 1 byte, payload-free — same safe convention as type 8/9
+                // so old Mac hosts drop 1 byte and stay aligned.
+                consumeInputBytes(1)
+                if !clientSupportsDisplayPower {
+                    clientSupportsDisplayPower = true
+                    debugLog("Client supports display power notifications")
+                }
+                // Sync current true/false immediately. Independent of type 8
+                // order and of whether connectionReady is already true (if not
+                // ready yet, finishProtocolStartup will sync after ready).
+                sendCachedDisplayPowerState()
 
             default:
                 debugLog("Unknown client input type: \(msgType)")

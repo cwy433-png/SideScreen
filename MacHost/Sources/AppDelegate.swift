@@ -591,6 +591,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
 
+            // Display sleep/wake → privacy mode on Android (gated by type 11 opt-in).
+            screenCapture?.onDisplayPowerChanged = { [weak self] sleeping in
+                self?.streamingServer?.sendDisplayPowerState(sleeping: sleeping)
+            }
+
             streamingServer?.onClientDisconnected = { [weak self] in
                 guard let self = self else { return }
                 Task { @MainActor in

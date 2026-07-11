@@ -71,6 +71,10 @@ class ScreenCapture {
     /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
     var onCaptureMethodChanged: ((String) -> Void)?
 
+    /// Display power change: true = host display sleeping, false = awake.
+    /// Wired by AppDelegate to StreamingServer.sendDisplayPowerState.
+    var onDisplayPowerChanged: ((Bool) -> Void)?
+
     /// Force the encoder to emit an IDR keyframe on the next frame.
     /// If the encoder hasn't been created yet (request arrived before
     /// startStreaming), the request is stored and applied at encoder init.
@@ -179,7 +183,16 @@ class ScreenCapture {
             }
             wakeObservers.append(token)
         }
-        debugLog("Wake observers registered")
+        // Sleep is an independent event — do not share wakeRestartPending.
+        let sleepToken = center.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleDisplaySleep()
+        }
+        wakeObservers.append(sleepToken)
+        debugLog("Wake/sleep observers registered")
     }
 
     private func unregisterWakeObservers() {
@@ -194,19 +207,29 @@ class ScreenCapture {
         unregisterWakeObservers()
     }
 
+    private func handleDisplaySleep() {
+        debugLog("Screens sleeping — notifying display power change")
+        onDisplayPowerChanged?(true)
+    }
+
     private func handleWake() {
-        // Only act while a capture is actually running.
+        // Only act while a capture is actually running (PR #42 entry guard).
         guard stream != nil || cgDisplayStream != nil else { return }
         // A full system wake fires both screensDidWake and didWake —
-        // coalesce them into a single restart.
+        // coalesce them into a single power notify + capture restart.
         guard !wakeRestartPending else { return }
         wakeRestartPending = true
-        debugLog("Screens woke — scheduling capture restart")
+        debugLog("Screens woke — scheduling display power restore + capture restart")
         // Give WindowServer a moment to settle before touching the stream.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
             self.wakeRestartPending = false
+            // Secondary guard: drop if capture stopped during the delay so we
+            // do not send awake or restart during teardown.
             guard self.stream != nil || self.cgDisplayStream != nil else { return }
+            // Awake notify after secondary guard, before restartStream — avoids
+            // incorrectly advertising awake while capture is stopping.
+            self.onDisplayPowerChanged?(false)
             // Display sleep usually kills SCStream with error -3815 ("no
             // displays or windows to capture"), which pushes capture onto the
             // CGDisplayStream fallback. After wake, always try to get back
