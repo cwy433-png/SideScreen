@@ -54,5 +54,12 @@ dependencies {
     implementation("androidx.camera:camera-view:1.3.1")
     implementation("com.google.mlkit:barcode-scanning:17.2.0")
 
+    // Ambient display: local photos (SAF) + muted looping video
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("androidx.media3:media3-exoplayer:1.2.1")
+    implementation("androidx.media3:media3-ui:1.2.1")
+
     testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests (android.jar stubs throw "not mocked")
+    testImplementation("org.json:json:20231013")
 }

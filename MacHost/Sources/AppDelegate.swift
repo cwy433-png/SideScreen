@@ -141,29 +141,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let port = Int(settings.port)
+        let localSyncPort = Int(AmbientSyncProtocol.localSyncPort(streamPort: settings.port))
+        let deviceSyncPort = Int(AmbientSyncProtocol.devicePort)
         Task.detached { [weak self] in
             let devices = StatusDetector.usbDevices()
             let reverseOK = StatusDetector.adbReverseConfigured(port: port)
+            let forwardOK = StatusDetector.adbForwardConfigured(
+                localPort: localSyncPort,
+                devicePort: deviceSyncPort
+            )
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
-                
+
                 let isConnected = !devices.isEmpty
 
                 self.settings.usbDeviceConnected = isConnected
+                // Reverse remains the primary "USB bridge OK" signal for the stream.
                 self.settings.adbReverseConfigured = reverseOK
+                self.settings.adbForwardConfigured = forwardOK
 
                 // Self-healing USB bridge (level-triggered, not edge-triggered):
                 // whenever we are in USB mode with the server running and a
-                // device present but adb reverse missing, (re)establish it.
-                // Covers replug, adb-server restart, etc. The server lifecycle
-                // is NOT tied to device events — it stays up and the tablet
-                // reconnects via its own connect button.
+                // device present but either adb reverse (stream) or adb forward
+                // (ambient sync) is missing, (re)establish both mappings.
+                // Do not remove existing mappings — only ensure both are present.
                 if self.settings.connectionMode == .usb
                     && isConnected
                     && self.settings.isRunning
-                    && !reverseOK {
-                    debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
-                    Task { await self.setupADBReverse() }
+                    && (!reverseOK || !forwardOK) {
+                    debugLog("🔌 USB bridge incomplete while running — (re)establishing reverse+forward")
+                    Task { await self.setupADBBridge() }
                 }
             }
         }
@@ -362,53 +369,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Setup ADB reverse port forwarding for USB connection
-    func setupADBReverse() async {
+    /// Setup ADB reverse (stream) + forward (ambient sync) for USB connection.
+    /// Preserves existing mappings; only ensures both are present.
+    func setupADBBridge() async {
         let port = settings.port
-        print("🔌 Setting up ADB reverse for port \(port)...")
-        debugLog("🔌 setupADBReverse() invoked for port \(port)...")
+        let localSyncPort = AmbientSyncProtocol.localSyncPort(streamPort: port)
+        let deviceSyncPort = AmbientSyncProtocol.devicePort
+        print("🔌 Setting up ADB reverse tcp:\(port) + forward tcp:\(localSyncPort)->tcp:\(deviceSyncPort)...")
+        debugLog("🔌 setupADBBridge() reverse=\(port) forward=\(localSyncPort)->\(deviceSyncPort)")
 
         await Task.detached(priority: .utility) {
-            // Try common adb paths
-            let adbPaths = [
-                "/usr/local/bin/adb",
-                "/opt/homebrew/bin/adb",
-                "~/Library/Android/sdk/platform-tools/adb",
-                "/Users/\(NSUserName())/Library/Android/sdk/platform-tools/adb"
-            ]
-
-            var adbPath: String?
-            for path in adbPaths {
-                let expandedPath = NSString(string: path).expandingTildeInPath
-                if FileManager.default.fileExists(atPath: expandedPath) {
-                    adbPath = expandedPath
-                    break
-                }
-            }
-
-            // Also try 'which adb' to find it in PATH
-            if adbPath == nil {
-                let whichProcess = Process()
-                whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-                whichProcess.arguments = ["adb"]
-                let whichPipe = Pipe()
-                whichProcess.standardOutput = whichPipe
-                whichProcess.standardError = FileHandle.nullDevice
-
-                do {
-                    try whichProcess.run()
-                    whichProcess.waitUntilExit()
-                    let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
-                    if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !path.isEmpty {
-                        adbPath = path
-                    }
-                } catch {
-                    // Ignore
-                }
-            }
-
-            guard let finalAdbPath = adbPath else {
+            guard let finalAdbPath = StatusDetector.resolveAdbPath() else {
                 print("⚠️  ADB not found - USB connection may not work")
                 print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
                 return
@@ -416,42 +387,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             print("📱 Found ADB at: \(finalAdbPath)")
 
-            // Retry adb reverse up to 3 times — handles first-install authorization delay
-            for attempt in 1...3 {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                process.arguments = ["reverse", "tcp:\(port)", "tcp:\(port)"]
+            // Reverse: tablet connects to Mac stream (existing path)
+            _ = await Self.runAdbMapping(
+                adbPath: finalAdbPath,
+                arguments: ["reverse", "tcp:\(port)", "tcp:\(port)"],
+                label: "reverse tcp:\(port) -> tcp:\(port)"
+            )
 
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
+            // Forward: Mac connects to tablet AmbientSyncServer (phase 2)
+            _ = await Self.runAdbMapping(
+                adbPath: finalAdbPath,
+                arguments: ["forward", "tcp:\(localSyncPort)", "tcp:\(deviceSyncPort)"],
+                label: "forward tcp:\(localSyncPort) -> tcp:\(deviceSyncPort)"
+            )
+        }.value
+    }
 
-                do {
-                    try process.run()
-                    process.waitUntilExit()
+    /// Backward-compatible name used by older call sites; sets up full USB bridge.
+    func setupADBReverse() async {
+        await setupADBBridge()
+    }
 
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
+    /// Run a single adb reverse/forward with up to 3 retries. Does not remove other mappings.
+    private static func runAdbMapping(adbPath: String, arguments: [String], label: String) async -> Bool {
+        for attempt in 1...3 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: adbPath)
+            process.arguments = arguments
 
-                    if process.terminationStatus == 0 {
-                        print("✅ ADB reverse setup successful: tcp:\(port) -> tcp:\(port)")
-                        return
-                    } else {
-                        print("⚠️  ADB reverse attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        }
-                    }
-                } catch {
-                    print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+
+                if process.terminationStatus == 0 {
+                    print("✅ ADB \(label) OK")
+                    return true
+                } else {
+                    print("⚠️  ADB \(label) attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
                     if attempt < 3 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }
                 }
+            } catch {
+                print("⚠️  Failed to run ADB \(label) (attempt \(attempt)/3): \(error.localizedDescription)")
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
             }
-
-            print("💡 Make sure Android device is connected via USB with debugging enabled")
-        }.value
+        }
+        print("💡 Make sure Android device is connected via USB with debugging enabled (\(label))")
+        return false
     }
 
     @MainActor

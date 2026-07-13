@@ -612,9 +612,10 @@ class StreamClient(
          * Codec-aware sync-frame (keyframe) detection on the legacy
          * MESSAGE_VIDEO_FRAME path. HEVC: IRAP NAL types 16..21 from
          * (header and 0x7E) shr 1. H.264: IDR slice, (header and 0x1F) == 5.
-         * Internal (not private) so unit tests can exercise both branches.
+         * Public so the app module's JVM tests can exercise both branches;
+         * some Android Gradle/Kotlin combinations do not wire internal friend paths.
          */
-        internal fun isSyncFrame(
+        fun isSyncFrame(
             data: ByteArray,
             size: Int,
             isHevc: Boolean,

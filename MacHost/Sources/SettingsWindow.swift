@@ -1,5 +1,6 @@
 import Cocoa
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Frosted GroupBox Component
 
@@ -464,6 +465,11 @@ struct SettingsView: View {
                                         .foregroundColor(.secondary)
                                 }
                             }
+                        }
+
+                        // USB-only: push ambient photos/video to the tablet over ADB forward.
+                        if settings.connectionMode == .usb {
+                            AmbientMediaSection(settings: settings)
                         }
 
                         // Wireless-mode-only: QR + Paired Devices.
@@ -1164,6 +1170,8 @@ class DisplaySettings: ObservableObject {
     @Published var hasAccessibilityPermission = false
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
+    /// Whether `adb forward` for ambient sync is present (USB mode).
+    @Published var adbForwardConfigured = false
     @Published var usbDeviceConnected = false
     @Published var wifiConnected = false
     @Published var listeningAddress: String?
@@ -1171,6 +1179,22 @@ class DisplaySettings: ObservableObject {
     @Published var currentFPS: Double = 0
     @Published var currentBitrate: Double = 0
     @Published var captureMethod: String = "Initializing..."
+
+    // Ambient media paths (persisted for owner convenience; validated on each send)
+    /// Which content type is active in Ambient Media UI (paths for both are retained).
+    @Published var ambientMediaSourceKind: AmbientMediaSourceKind {
+        didSet { save("ambientMediaSourceKind", ambientMediaSourceKind.rawValue) }
+    }
+    @Published var ambientPhotoFolderPath: String {
+        didSet { save("ambientPhotoFolderPath", ambientPhotoFolderPath) }
+    }
+    @Published var ambientVideoPath: String {
+        didSet { save("ambientVideoPath", ambientVideoPath) }
+    }
+    /// Runtime-only sync status text (ACK / error / progress).
+    @Published var ambientSyncStatus: String = ""
+    /// True while a send/clear is in flight — disables overlapping sends.
+    @Published var ambientSyncBusy: Bool = false
 
     var onToggleServer: (() -> Void)?
 
@@ -1194,6 +1218,10 @@ class DisplaySettings: ObservableObject {
         self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
         let startupRaw = defaults.string(forKey: keyPrefix + "startupMode") ?? modeRaw
         self.startupMode = ConnectionMode(rawValue: startupRaw) ?? .usb
+        let sourceRaw = defaults.string(forKey: keyPrefix + "ambientMediaSourceKind") ?? AmbientMediaSourceKind.photos.rawValue
+        self.ambientMediaSourceKind = AmbientMediaSourceKind(rawValue: sourceRaw) ?? .photos
+        self.ambientPhotoFolderPath = defaults.string(forKey: keyPrefix + "ambientPhotoFolderPath") ?? ""
+        self.ambientVideoPath = defaults.string(forKey: keyPrefix + "ambientVideoPath") ?? ""
 
         print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
     }
@@ -1257,7 +1285,8 @@ class DisplaySettings: ObservableObject {
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode",
+                    "ambientMediaSourceKind", "ambientPhotoFolderPath", "ambientVideoPath"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1276,8 +1305,113 @@ class DisplaySettings: ObservableObject {
         touchEnabled = true
         autoStartStreamingOnLaunch = false
         startupMode = .usb
+        ambientMediaSourceKind = .photos
+        ambientPhotoFolderPath = ""
+        ambientVideoPath = ""
+        ambientSyncStatus = ""
+        ambientSyncBusy = false
 
         print("Settings reset to defaults")
+    }
+
+    /// Local Mac port used for ambient sync (`adb forward`).
+    var ambientSyncLocalPort: UInt16 {
+        AmbientSyncProtocol.localSyncPort(streamPort: port)
+    }
+
+    /// Validate the active source path and push ambient media (or clear) off MainActor.
+    /// Only the currently selected Photos/Video path is sent; the other path is left alone.
+    /// Clear removes tablet-synced media only — does not change tablet ambient mode.
+    func sendAmbientMedia(clearOnly: Bool) {
+        guard !ambientSyncBusy else { return }
+
+        let photoPath = ambientPhotoFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let videoPath = ambientVideoPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localPort = ambientSyncLocalPort
+        let sourceKind = ambientMediaSourceKind
+        let fm = FileManager.default
+
+        var photoURL: URL?
+        var videoURL: URL?
+        var preferredMode: AmbientSyncProtocol.PreferredMode?
+
+        if !clearOnly {
+            switch sourceKind {
+            case .photos:
+                guard !photoPath.isEmpty else {
+                    ambientSyncStatus = "Choose a photo folder, or use Clear Tablet Media"
+                    return
+                }
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: photoPath, isDirectory: &isDir), isDir.boolValue else {
+                    ambientSyncStatus = "Photo folder missing: \(photoPath)"
+                    return
+                }
+                photoURL = URL(fileURLWithPath: photoPath, isDirectory: true)
+                preferredMode = .photos
+            case .video:
+                guard !videoPath.isEmpty else {
+                    ambientSyncStatus = "Choose a video file, or use Clear Tablet Media"
+                    return
+                }
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: videoPath, isDirectory: &isDir), !isDir.boolValue else {
+                    ambientSyncStatus = "Video file missing: \(videoPath)"
+                    return
+                }
+                videoURL = URL(fileURLWithPath: videoPath)
+                preferredMode = .video
+            }
+        }
+
+        ambientSyncBusy = true
+        ambientSyncStatus = clearOnly ? "Clearing tablet media…" : "Sending…"
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let result = try AmbientSyncClient.send(
+                    localPort: localPort,
+                    photoFolder: photoURL,
+                    videoFile: videoURL,
+                    clearOnly: clearOnly,
+                    preferredMode: preferredMode
+                ) { progress in
+                    Task { @MainActor [weak self] in
+                        self?.ambientSyncStatus = progress
+                    }
+                }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.ambientSyncBusy = false
+                    if result.ok {
+                        self.ambientSyncStatus = clearOnly
+                            ? "Cleared: \(result.message)"
+                            : "Sent: \(result.message)"
+                    } else {
+                        self.ambientSyncStatus = "Failed: \(result.message)"
+                    }
+                }
+            } catch let err as AmbientSyncProtocol.ProtocolError {
+                let msg: String
+                switch err {
+                case .invalidMagic: msg = "invalid ACK magic"
+                case .unsupportedVersion(let v): msg = "unsupported version \(v)"
+                case .truncated: msg = "connection truncated"
+                case .ackFailed(let m): msg = m
+                case .limitExceeded(let m): msg = m
+                case .io(let m): msg = m
+                }
+                await MainActor.run { [weak self] in
+                    self?.ambientSyncBusy = false
+                    self?.ambientSyncStatus = "Error: \(msg)"
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.ambientSyncBusy = false
+                    self?.ambientSyncStatus = "Error: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     var resolutionSize: (width: Int, height: Int) {
@@ -1375,6 +1509,198 @@ class ConstrainedWindow: NSWindow {
         }
 
         return constrainedRect
+    }
+}
+
+// MARK: - Ambient media source kind (Mac UI)
+
+/// Persisted Photos / Video selector. Paths for both kinds are kept when switching.
+enum AmbientMediaSourceKind: String, CaseIterable, Identifiable {
+    case photos
+    case video
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .photos: return "Photos"
+        case .video: return "Video"
+        }
+    }
+}
+
+// MARK: - Ambient Media Section (USB)
+
+struct AmbientMediaSection: View {
+    @ObservedObject var settings: DisplaySettings
+
+    private var photoDisplayName: String {
+        let path = settings.ambientPhotoFolderPath
+        if path.isEmpty { return "None selected" }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private var videoDisplayName: String {
+        let path = settings.ambientVideoPath
+        if path.isEmpty { return "None selected" }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    var body: some View {
+        FrostedGroupBox(title: "Ambient Media", icon: "photo.on.rectangle.angled") {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Choose content on this Mac, then Send to Tablet. Files are copied to the tablet over USB; after the Mac sleeps, ambient play does not depend on the Mac. Uses a separate ADB forward (not the stream socket).")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Content type: Photos / Video (mutually exclusive send; paths retained)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Playback content")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Picker("Playback content", selection: $settings.ambientMediaSourceKind) {
+                        ForEach(AmbientMediaSourceKind.allCases) { kind in
+                            Text(kind.label).tag(kind)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(settings.ambientSyncBusy)
+                    .labelsHidden()
+                }
+
+                // Only the active source path is shown; the other remains stored.
+                if settings.ambientMediaSourceKind == .photos {
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Photo folder")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            Text(photoDisplayName)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if !settings.ambientPhotoFolderPath.isEmpty {
+                                Text(settings.ambientPhotoFolderPath)
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        Button("Choose…") { choosePhotoFolder() }
+                            .disabled(settings.ambientSyncBusy)
+                        Button("Clear") {
+                            settings.ambientPhotoFolderPath = ""
+                        }
+                        .disabled(settings.ambientSyncBusy || settings.ambientPhotoFolderPath.isEmpty)
+                    }
+                } else {
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Video")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            Text(videoDisplayName)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if !settings.ambientVideoPath.isEmpty {
+                                Text(settings.ambientVideoPath)
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        Button("Choose…") { chooseVideo() }
+                            .disabled(settings.ambientSyncBusy)
+                        Button("Clear") {
+                            settings.ambientVideoPath = ""
+                        }
+                        .disabled(settings.ambientSyncBusy || settings.ambientVideoPath.isEmpty)
+                    }
+                }
+
+                Divider()
+
+                HStack(spacing: 8) {
+                    Button(action: { settings.sendAmbientMedia(clearOnly: false) }) {
+                        HStack(spacing: 4) {
+                            if settings.ambientSyncBusy {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Text("Send to Tablet")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(settings.ambientSyncBusy)
+
+                    Button("Clear Tablet Media") {
+                        settings.sendAmbientMedia(clearOnly: true)
+                    }
+                    .disabled(settings.ambientSyncBusy)
+                    .help("Removes tablet-synced media only. Does not delete Mac files, clear tablet SAF fallbacks, or change ambient mode.")
+                }
+
+                Text("Local sync port: \(settings.ambientSyncLocalPort) → device \(AmbientSyncProtocol.devicePort)")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+
+                if !settings.ambientSyncStatus.isEmpty {
+                    Text(settings.ambientSyncStatus)
+                        .font(.system(size: 11))
+                        .foregroundColor(statusColor)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var statusColor: Color {
+        let s = settings.ambientSyncStatus.lowercased()
+        if s.hasPrefix("sent") || s.hasPrefix("cleared") { return .green }
+        if s.hasPrefix("failed") || s.hasPrefix("error") { return .red }
+        return .secondary
+    }
+
+    private func choosePhotoFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.message = "Choose a folder of photos (jpg/png/webp, non-recursive)"
+        panel.prompt = "Select"
+        if panel.runModal() == .OK, let url = panel.url {
+            settings.ambientPhotoFolderPath = url.path
+        }
+    }
+
+    private func chooseVideo() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        // Match protocol v1 extensions (mp4/mov/webm/mkv). AVI is not accepted on the wire.
+        // Validation in AmbientSyncProtocol remains authoritative.
+        panel.allowsOtherFileTypes = false
+        var videoTypes: [UTType] = [.mpeg4Movie, .quickTimeMovie]
+        if let webm = UTType(filenameExtension: "webm") {
+            videoTypes.append(webm)
+        }
+        if let mkv = UTType(filenameExtension: "mkv") {
+            videoTypes.append(mkv)
+        }
+        panel.allowedContentTypes = videoTypes
+        panel.message = "Choose a single ambient video (mp4/mov/webm/mkv)"
+        panel.prompt = "Select"
+        if panel.runModal() == .OK, let url = panel.url {
+            settings.ambientVideoPath = url.path
+        }
     }
 }
 

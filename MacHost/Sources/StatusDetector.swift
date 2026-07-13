@@ -57,6 +57,32 @@ enum StatusDetector {
         return output.contains("tcp:\(port) tcp:\(port)")
     }
 
+    /// Heuristic: parse `adb forward --list` for `tcp:<localPort> tcp:<devicePort>`.
+    static func adbForwardConfigured(localPort: Int, devicePort: Int) -> Bool {
+        guard let adbPath = adbExecutablePath() else { return false }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: adbPath)
+        task.arguments = ["forward", "--list"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return false
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        // Format: <serial> tcp:<local> tcp:<remote>
+        return output.contains("tcp:\(localPort) tcp:\(devicePort)")
+    }
+
+    /// Shared ADB executable resolution for AppDelegate USB bridge setup.
+    static func resolveAdbPath() -> String? {
+        adbExecutablePath()
+    }
+
     private static var cachedAdbPath: String?
     private static var lastAdbCacheCheck: Date = .distantPast
 

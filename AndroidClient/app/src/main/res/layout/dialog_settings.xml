@@ -76,8 +76,317 @@
                 app:trackTint="@color/switch_track_color" />
         </LinearLayout>
 
-        <!-- Allow tablet to sleep while host display is sleeping -->
+        <!-- Ambient display mode -->
         <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/settings_item_bg"
+            android:padding="16dp"
+            android:layout_marginBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Ambient display"
+                android:textColor="#FFFFFF"
+                android:textSize="17sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="4dp" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Shown while the Mac display is sleeping"
+                android:textColor="#999999"
+                android:textSize="13sp"
+                android:layout_marginBottom="12dp" />
+
+            <RadioGroup
+                android:id="@+id/ambientModeGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <RadioButton
+                    android:id="@+id/ambientModeBlack"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Black"
+                    android:textColor="#FFFFFF"
+                    android:buttonTint="#4CAF50" />
+                <RadioButton
+                    android:id="@+id/ambientModeClock"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Clock"
+                    android:textColor="#FFFFFF"
+                    android:buttonTint="#4CAF50" />
+                <RadioButton
+                    android:id="@+id/ambientModePhotos"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Photos"
+                    android:textColor="#FFFFFF"
+                    android:buttonTint="#4CAF50" />
+                <RadioButton
+                    android:id="@+id/ambientModeVideo"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Video"
+                    android:textColor="#FFFFFF"
+                    android:buttonTint="#4CAF50" />
+            </RadioGroup>
+
+            <!-- Primary media source: Mac-managed (always visible) -->
+            <TextView
+                android:id="@+id/macMediaSourceHint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Media source: Managed from SideScreen on Mac"
+                android:textColor="#B0BEC5"
+                android:textSize="12sp"
+                android:maxLines="2"
+                android:ellipsize="end" />
+
+            <!-- In-memory Mac sync status (not persisted across process death) -->
+            <TextView
+                android:id="@+id/macSyncStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="#AAAAAA"
+                android:textSize="12sp"
+                android:text="Mac sync: —"
+                android:maxLines="2"
+                android:ellipsize="end" />
+
+            <!-- In-memory fallback status (not persisted across process death) -->
+            <TextView
+                android:id="@+id/ambientFallbackStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="#FF8A80"
+                android:textSize="12sp"
+                android:visibility="gone"
+                android:maxLines="4"
+                android:ellipsize="end" />
+
+            <!-- Advanced: tablet-local SAF fallback (collapsed by default; UI state only) -->
+            <LinearLayout
+                android:id="@+id/advancedFallbackHeader"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginTop="14dp"
+                android:paddingTop="8dp"
+                android:paddingBottom="4dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:background="?android:attr/selectableItemBackground">
+
+                <TextView
+                    android:id="@+id/advancedFallbackChevron"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="▸"
+                    android:textColor="#AAAAAA"
+                    android:textSize="14sp"
+                    android:layout_marginEnd="8dp" />
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Advanced: tablet-local fallback"
+                    android:textColor="#CCCCCC"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/advancedFallbackContent"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="Optional local files used only when Mac-synced media is missing. Prefer managing media from SideScreen on Mac."
+                    android:textColor="#888888"
+                    android:textSize="11sp"
+                    android:maxLines="3"
+                    android:ellipsize="end" />
+
+                <!-- Photo folder picker (SAF) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="10dp">
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:layout_marginEnd="8dp">
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Photo folder"
+                            android:textColor="#CCCCCC"
+                            android:textSize="13sp" />
+                        <TextView
+                            android:id="@+id/photoFolderName"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="None selected"
+                            android:textColor="#888888"
+                            android:textSize="12sp"
+                            android:maxLines="2"
+                            android:ellipsize="end" />
+                    </LinearLayout>
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/selectPhotoFolderButton"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="40dp"
+                        android:text="Select"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        app:cornerRadius="10dp"
+                        app:strokeColor="#4CAF50"
+                        app:strokeWidth="1dp" />
+                </LinearLayout>
+
+                <!-- Video file picker (SAF) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="12dp">
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:layout_marginEnd="8dp">
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Video file"
+                            android:textColor="#CCCCCC"
+                            android:textSize="13sp" />
+                        <TextView
+                            android:id="@+id/videoFileName"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="None selected"
+                            android:textColor="#888888"
+                            android:textSize="12sp"
+                            android:maxLines="2"
+                            android:ellipsize="end" />
+                    </LinearLayout>
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/selectVideoButton"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="40dp"
+                        android:text="Select"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        app:cornerRadius="10dp"
+                        app:strokeColor="#4CAF50"
+                        app:strokeWidth="1dp" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Night window -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/settings_item_bg"
+            android:padding="16dp"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Night window"
+                        android:textColor="#FFFFFF"
+                        android:textSize="17sp"
+                        android:textStyle="bold" />
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Force black and allow screen off during this period"
+                        android:textColor="#999999"
+                        android:textSize="13sp" />
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/nightWindowSwitch"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="false"
+                    app:thumbTint="@color/switch_thumb_color"
+                    app:trackTint="@color/switch_track_color" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginTop="12dp">
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/nightStartButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="22:00"
+                    android:textColor="#FFFFFF"
+                    android:layout_marginEnd="6dp"
+                    app:cornerRadius="10dp"
+                    app:strokeColor="#4CAF50"
+                    app:strokeWidth="1dp" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/nightEndButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="07:00"
+                    android:textColor="#FFFFFF"
+                    android:layout_marginStart="6dp"
+                    app:cornerRadius="10dp"
+                    app:strokeColor="#4CAF50"
+                    app:strokeWidth="1dp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Allow tablet to sleep while host display is sleeping (BLACK mode only) -->
+        <LinearLayout
+            android:id="@+id/allowScreenOffRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
@@ -99,6 +408,7 @@
                     android:textSize="17sp"
                     android:textStyle="bold" />
                 <TextView
+                    android:id="@+id/allowScreenOffHint"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="When Mac display sleeps, let tablet screen turn off"

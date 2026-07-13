@@ -2,6 +2,7 @@ package com.sidescreen.app
 
 import android.annotation.SuppressLint
 import android.app.Dialog
+import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -10,11 +11,13 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -23,10 +26,13 @@ import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.RadioGroup
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.constraintlayout.widget.ConstraintSet
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.slider.Slider
@@ -36,6 +42,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.Calendar
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
@@ -45,6 +52,9 @@ class MainActivity : AppCompatActivity() {
     private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
+    private lateinit var ambientController: AmbientDisplayController
+    private lateinit var ambientMediaStore: AmbientMediaStore
+    private var ambientSyncServer: AmbientSyncServer? = null
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
@@ -70,6 +80,75 @@ class MainActivity : AppCompatActivity() {
     /** Tracks host-display privacy overlay state for idempotent setPrivacyMode. */
     private var privacyModeActive = false
 
+    // Night-window boundary re-evaluation while privacy is active
+    private val nightBoundaryHandler = Handler(Looper.getMainLooper())
+    private var nightBoundaryRunnable: Runnable? = null
+
+    // Live labels in an open settings dialog (updated after SAF picks / Mac sync)
+    private var settingsPhotoNameView: TextView? = null
+    private var settingsVideoNameView: TextView? = null
+    private var settingsAmbientStatusView: TextView? = null
+    private var settingsMacSyncStatusView: TextView? = null
+    /** When settings is open, keep mode radios in sync with Mac preferredMode apply. */
+    private var settingsAmbientModeGroup: RadioGroup? = null
+    private var settingsAllowScreenOffSwitch: SwitchMaterial? = null
+    private var settingsAllowScreenOffHint: TextView? = null
+
+    /**
+     * Last ambient PHOTOS/VIDEO fallback reason for the settings dialog.
+     * In-memory only — never persisted across process death.
+     */
+    private var ambientFallbackStatus: String? = null
+
+    /**
+     * Compact Mac ambient-sync status for the settings dialog.
+     * In-memory only — never persisted; rebuilt from store on launch when possible.
+     */
+    private var macSyncStatusText: String = "—"
+
+    private val pickPhotoTree =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (e: SecurityException) {
+                mainDiag("Photo tree persist permission failed: ${e.message}")
+            }
+            prefs.photoTreeUri = uri.toString()
+            val name =
+                DocumentFile.fromTreeUri(this, uri)?.name
+                    ?: uri.lastPathSegment
+                    ?: "Folder"
+            prefs.photoTreeDisplayName = name
+            settingsPhotoNameView?.text = name
+            if (privacyModeActive) {
+                applyAmbientContent()
+            }
+        }
+
+    private val pickVideoFile =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (e: SecurityException) {
+                mainDiag("Video persist permission failed: ${e.message}")
+            }
+            prefs.videoUri = uri.toString()
+            val name = queryDisplayName(uri) ?: uri.lastPathSegment ?: "Video"
+            prefs.videoDisplayName = name
+            settingsVideoNameView?.text = name
+            if (privacyModeActive) {
+                applyAmbientContent()
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -90,6 +169,58 @@ class MainActivity : AppCompatActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        ambientMediaStore = AmbientMediaStore(filesDir)
+        macSyncStatusText =
+            if (ambientMediaStore.hasSyncedMedia()) {
+                ambientMediaStore.summaryOrEmpty()
+            } else {
+                "—"
+            }
+        ambientSyncServer =
+            AmbientSyncServer(ambientMediaStore) { summary, preferredMode ->
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    macSyncStatusText = summary
+                    settingsMacSyncStatusView?.text = "Mac sync: $summary"
+                    // Apply preferredMode only after successful commit. Clear, failure,
+                    // interruption, and legacy manifests leave preferredMode null → keep mode.
+                    if (preferredMode != null) {
+                        val mode = preferredMode.toAmbientMode()
+                        prefs.ambientMode = mode
+                        syncOpenSettingsAmbientModeUi(mode)
+                    }
+                    if (privacyModeActive) {
+                        applyAmbientContent()
+                    }
+                }
+            }
+        ambientSyncServer?.start()
+
+        ambientController =
+            AmbientDisplayController(
+                activity = this,
+                clockView = binding.ambientClock,
+                imageContainer = binding.ambientImage,
+                imageA = binding.ambientImageA,
+                imageB = binding.ambientImageB,
+                playerView = binding.ambientVideo,
+                contentResolver = contentResolver,
+            )
+        ambientController.onFallbackToClock = { reason ->
+            mainDiag("Ambient fallback to CLOCK: $reason")
+            val message = userFacingAmbientFallback(reason)
+            ambientFallbackStatus = message
+            settingsAmbientStatusView?.let { tv ->
+                tv.text = message
+                tv.visibility = View.VISIBLE
+            }
+        }
+        // Settings button sits under the overlay; tap catcher opens settings while
+        // the streamed frame remains fully covered by the black ambient container.
+        val openAmbientSettings = View.OnClickListener { showSettingsDialog() }
+        binding.privacyOverlay.setOnClickListener(openAmbientSettings)
+        binding.ambientTapCatcher.setOnClickListener(openAmbientSettings)
 
         // Apply fullscreen mode immediately
         enableFullscreenMode()
@@ -473,6 +604,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * When settings is open, mirror Mac-applied preferredMode into radios and
+     * allow-screen-off availability without double-writing prefs.
+     */
+    private fun syncOpenSettingsAmbientModeUi(mode: AmbientMode) {
+        val group = settingsAmbientModeGroup ?: return
+        val radioId =
+            when (mode) {
+                AmbientMode.BLACK -> R.id.ambientModeBlack
+                AmbientMode.CLOCK -> R.id.ambientModeClock
+                AmbientMode.PHOTOS -> R.id.ambientModePhotos
+                AmbientMode.VIDEO -> R.id.ambientModeVideo
+            }
+        group.setOnCheckedChangeListener(null)
+        group.check(radioId)
+        val allowEnabled = mode == AmbientMode.BLACK
+        settingsAllowScreenOffSwitch?.isEnabled = allowEnabled
+        settingsAllowScreenOffHint?.text =
+            if (allowEnabled) {
+                "When Mac display sleeps, let tablet screen turn off"
+            } else {
+                "Only available in Black mode (clock/photos/video keep the screen on)"
+            }
+        group.setOnCheckedChangeListener { _, checkedId ->
+            val selected =
+                when (checkedId) {
+                    R.id.ambientModeClock -> AmbientMode.CLOCK
+                    R.id.ambientModePhotos -> AmbientMode.PHOTOS
+                    R.id.ambientModeVideo -> AmbientMode.VIDEO
+                    else -> AmbientMode.BLACK
+                }
+            prefs.ambientMode = selected
+            val enabled = selected == AmbientMode.BLACK
+            settingsAllowScreenOffSwitch?.isEnabled = enabled
+            settingsAllowScreenOffHint?.text =
+                if (enabled) {
+                    "When Mac display sleeps, let tablet screen turn off"
+                } else {
+                    "Only available in Black mode (clock/photos/video keep the screen on)"
+                }
+            if (privacyModeActive) {
+                applyAmbientContent()
+            }
+        }
+    }
+
     @SuppressLint("InflateParams", "SetTextI18n")
     private fun showSettingsDialog() {
         val dialog = Dialog(this)
@@ -483,12 +660,64 @@ class MainActivity : AppCompatActivity() {
         val view = dialog.findViewById<View>(android.R.id.content)
         val showStatsSwitch = view.findViewById<SwitchMaterial>(R.id.showStatsSwitch)
         val allowScreenOffSwitch = view.findViewById<SwitchMaterial>(R.id.allowScreenOffOnHostSleepSwitch)
+        val allowScreenOffHint = view.findViewById<TextView>(R.id.allowScreenOffHint)
+        val ambientModeGroup = view.findViewById<RadioGroup>(R.id.ambientModeGroup)
+        val photoFolderName = view.findViewById<TextView>(R.id.photoFolderName)
+        val videoFileName = view.findViewById<TextView>(R.id.videoFileName)
+        val ambientFallbackStatusView = view.findViewById<TextView>(R.id.ambientFallbackStatus)
+        val macSyncStatusView = view.findViewById<TextView>(R.id.macSyncStatus)
+        val selectPhotoFolderButton = view.findViewById<MaterialButton>(R.id.selectPhotoFolderButton)
+        val selectVideoButton = view.findViewById<MaterialButton>(R.id.selectVideoButton)
+        val advancedFallbackHeader = view.findViewById<View>(R.id.advancedFallbackHeader)
+        val advancedFallbackContent = view.findViewById<View>(R.id.advancedFallbackContent)
+        val advancedFallbackChevron = view.findViewById<TextView>(R.id.advancedFallbackChevron)
+        val nightWindowSwitch = view.findViewById<SwitchMaterial>(R.id.nightWindowSwitch)
+        val nightStartButton = view.findViewById<MaterialButton>(R.id.nightStartButton)
+        val nightEndButton = view.findViewById<MaterialButton>(R.id.nightEndButton)
         val opacitySlider = view.findViewById<Slider>(R.id.opacitySlider)
         val opacityValue = view.findViewById<TextView>(R.id.opacityValue)
         val resetButton = view.findViewById<View>(R.id.resetPositionButton)
         val resetSettingsBtn = view.findViewById<View>(R.id.resetSettingsButton)
         val disconnectButton = view.findViewById<View>(R.id.disconnectSettingsButton)
         val closeButton = view.findViewById<View>(R.id.closeButton)
+
+        settingsPhotoNameView = photoFolderName
+        settingsVideoNameView = videoFileName
+        settingsAmbientStatusView = ambientFallbackStatusView
+        settingsMacSyncStatusView = macSyncStatusView
+        settingsAmbientModeGroup = ambientModeGroup
+        settingsAllowScreenOffSwitch = allowScreenOffSwitch
+        settingsAllowScreenOffHint = allowScreenOffHint
+        macSyncStatusView.text = "Mac sync: $macSyncStatusText"
+
+        // Advanced: tablet-local fallback — collapsed by default (UI-only, not persisted).
+        advancedFallbackContent.visibility = View.GONE
+        advancedFallbackChevron.text = "▸"
+        advancedFallbackHeader.setOnClickListener {
+            val expand = advancedFallbackContent.visibility != View.VISIBLE
+            advancedFallbackContent.visibility = if (expand) View.VISIBLE else View.GONE
+            advancedFallbackChevron.text = if (expand) "▾" else "▸"
+        }
+
+        dialog.setOnDismissListener {
+            if (settingsPhotoNameView === photoFolderName) settingsPhotoNameView = null
+            if (settingsVideoNameView === videoFileName) settingsVideoNameView = null
+            if (settingsAmbientStatusView === ambientFallbackStatusView) {
+                settingsAmbientStatusView = null
+            }
+            if (settingsMacSyncStatusView === macSyncStatusView) {
+                settingsMacSyncStatusView = null
+            }
+            if (settingsAmbientModeGroup === ambientModeGroup) {
+                settingsAmbientModeGroup = null
+            }
+            if (settingsAllowScreenOffSwitch === allowScreenOffSwitch) {
+                settingsAllowScreenOffSwitch = null
+            }
+            if (settingsAllowScreenOffHint === allowScreenOffHint) {
+                settingsAllowScreenOffHint = null
+            }
+        }
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
@@ -509,6 +738,112 @@ class MainActivity : AppCompatActivity() {
         allowScreenOffSwitch.isChecked = prefs.allowScreenOffOnHostSleep
         opacitySlider.value = prefs.overlayOpacity
         opacityValue.text = "${(prefs.overlayOpacity * 100).toInt()}%"
+        photoFolderName.text = prefs.photoTreeDisplayName ?: "None selected"
+        videoFileName.text = prefs.videoDisplayName ?: "None selected"
+        val lastFallback = ambientFallbackStatus
+        if (lastFallback.isNullOrBlank()) {
+            ambientFallbackStatusView.visibility = View.GONE
+            ambientFallbackStatusView.text = ""
+        } else {
+            ambientFallbackStatusView.text = lastFallback
+            ambientFallbackStatusView.visibility = View.VISIBLE
+        }
+        nightWindowSwitch.isChecked = prefs.nightWindowEnabled
+        nightStartButton.text = prefs.nightStart
+        nightEndButton.text = prefs.nightEnd
+
+        fun radioIdForMode(mode: AmbientMode): Int =
+            when (mode) {
+                AmbientMode.BLACK -> R.id.ambientModeBlack
+                AmbientMode.CLOCK -> R.id.ambientModeClock
+                AmbientMode.PHOTOS -> R.id.ambientModePhotos
+                AmbientMode.VIDEO -> R.id.ambientModeVideo
+            }
+
+        fun modeForRadioId(id: Int): AmbientMode =
+            when (id) {
+                R.id.ambientModeClock -> AmbientMode.CLOCK
+                R.id.ambientModePhotos -> AmbientMode.PHOTOS
+                R.id.ambientModeVideo -> AmbientMode.VIDEO
+                else -> AmbientMode.BLACK
+            }
+
+        fun updateAllowScreenOffEnabled(mode: AmbientMode) {
+            val enabled = mode == AmbientMode.BLACK
+            allowScreenOffSwitch.isEnabled = enabled
+            if (enabled) {
+                allowScreenOffHint.text = "When Mac display sleeps, let tablet screen turn off"
+            } else {
+                allowScreenOffHint.text =
+                    "Only available in Black mode (clock/photos/video keep the screen on)"
+            }
+        }
+
+        fun attachAmbientModeListener() {
+            ambientModeGroup.setOnCheckedChangeListener { _, checkedId ->
+                val mode = modeForRadioId(checkedId)
+                prefs.ambientMode = mode
+                updateAllowScreenOffEnabled(mode)
+                if (privacyModeActive) {
+                    applyAmbientContent()
+                }
+            }
+        }
+
+        ambientModeGroup.check(radioIdForMode(prefs.ambientMode))
+        updateAllowScreenOffEnabled(prefs.ambientMode)
+        attachAmbientModeListener()
+
+        selectPhotoFolderButton.setOnClickListener {
+            pickPhotoTree.launch(null)
+        }
+
+        selectVideoButton.setOnClickListener {
+            pickVideoFile.launch(arrayOf("video/*"))
+        }
+
+        nightWindowSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.nightWindowEnabled = isChecked
+            if (privacyModeActive) {
+                applyAmbientContent()
+            }
+        }
+
+        nightStartButton.setOnClickListener {
+            val minutes = NightWindow.parseHhMm(prefs.nightStart)
+            TimePickerDialog(
+                this,
+                { _, hourOfDay, minute ->
+                    val formatted = NightWindow.formatHhMm(hourOfDay * 60 + minute)
+                    prefs.nightStart = formatted
+                    nightStartButton.text = formatted
+                    if (privacyModeActive) {
+                        applyAmbientContent()
+                    }
+                },
+                minutes / 60,
+                minutes % 60,
+                true,
+            ).show()
+        }
+
+        nightEndButton.setOnClickListener {
+            val minutes = NightWindow.parseHhMm(prefs.nightEnd)
+            TimePickerDialog(
+                this,
+                { _, hourOfDay, minute ->
+                    val formatted = NightWindow.formatHhMm(hourOfDay * 60 + minute)
+                    prefs.nightEnd = formatted
+                    nightEndButton.text = formatted
+                    if (privacyModeActive) {
+                        applyAmbientContent()
+                    }
+                },
+                minutes / 60,
+                minutes % 60,
+                true,
+            ).show()
+        }
 
         // Highlight current position selection (8 positions)
         // 0=BottomRight, 1=BottomLeft, 2=TopRight, 3=TopLeft
@@ -545,13 +880,9 @@ class MainActivity : AppCompatActivity() {
 
         allowScreenOffSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.allowScreenOffOnHostSleep = isChecked
-            // Re-apply flag while already in privacy mode without flipping overlay.
+            // Re-apply effective ambient + flags without re-entering privacy mode.
             if (privacyModeActive) {
-                if (isChecked) {
-                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                } else {
-                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                }
+                applyAmbientContent()
             }
         }
 
@@ -977,30 +1308,173 @@ class MainActivity : AppCompatActivity() {
      * Single entry for host-display privacy mode. Idempotent: repeating the
      * same sleeping value has no side effects (fast sleep/wake loops stay clean).
      *
-     * sleeping=true  → show black overlay; optionally release KEEP_SCREEN_ON
-     * sleeping=false → hide overlay; restore KEEP_SCREEN_ON; try turnScreenOn
+     * sleeping=true  → show ambient container; apply effective content + flags
+     * sleeping=false → hide container; stop media; restore KEEP_SCREEN_ON
      */
     private fun setPrivacyMode(sleeping: Boolean) {
         if (privacyModeActive == sleeping) return
         privacyModeActive = sleeping
         if (sleeping) {
             binding.privacyOverlay.visibility = View.VISIBLE
-            if (prefs.allowScreenOffOnHostSleep) {
-                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            }
             // Clear sticky turn-screen-on so a later Activity resume does not
             // unexpectedly relight the display after host sleep.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 setTurnScreenOn(false)
             }
-            mainDiag("Privacy mode ON (allowScreenOff=${prefs.allowScreenOffOnHostSleep})")
+            applyAmbientContent()
+            mainDiag(
+                "Privacy mode ON (mode=${prefs.ambientMode}, " +
+                    "allowScreenOff=${prefs.allowScreenOffOnHostSleep}, " +
+                    "night=${prefs.nightWindowEnabled})",
+            )
         } else {
+            cancelNightBoundary()
+            ambientController.stopAll()
             binding.privacyOverlay.visibility = View.GONE
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 setTurnScreenOn(true)
             }
             mainDiag("Privacy mode OFF")
+        }
+    }
+
+    /**
+     * Apply priority rules while privacy is active (or no-op when inactive):
+     *  - night window → effective BLACK + clear KEEP_SCREEN_ON
+     *  - else selected ambient mode; KEEP_SCREEN_ON cleared only for
+     *    BLACK + allowScreenOffOnHostSleep
+     * Setting changes call this without re-entering privacy mode.
+     */
+    private fun applyAmbientContent() {
+        if (!privacyModeActive) return
+
+        // New apply clears any prior fallback banner; async failures re-populate it.
+        clearAmbientFallbackStatus()
+
+        val inNight =
+            if (prefs.nightWindowEnabled) {
+                val cal = Calendar.getInstance()
+                val nowMinutes = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+                NightWindow.isInside(
+                    nowMinutes,
+                    NightWindow.parseHhMm(prefs.nightStart),
+                    NightWindow.parseHhMm(prefs.nightEnd),
+                )
+            } else {
+                false
+            }
+
+        val selected = prefs.ambientMode
+        val effective = if (inNight) AmbientMode.BLACK else selected
+
+        val releaseKeepScreenOn =
+            when {
+                inNight -> true
+                effective == AmbientMode.BLACK && prefs.allowScreenOffOnHostSleep -> true
+                else -> false
+            }
+        if (releaseKeepScreenOn) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+
+        val syncedBatch =
+            if (::ambientMediaStore.isInitialized) {
+                ambientMediaStore.loadBatch()
+            } else {
+                null
+            }
+
+        ambientController.apply(
+            mode = effective,
+            photoTreeUri = prefs.photoTreeUri,
+            videoUri = prefs.videoUri,
+            syncedPhotoUris = syncedBatch?.photoUris ?: emptyList(),
+            syncedVideoUri = syncedBatch?.videoUri,
+        )
+
+        if (prefs.nightWindowEnabled) {
+            scheduleNightBoundary()
+        } else {
+            cancelNightBoundary()
+        }
+
+        mainDiag(
+            "Ambient applied: selected=$selected effective=$effective " +
+                "inNight=$inNight releaseKeepOn=$releaseKeepScreenOn",
+        )
+    }
+
+    /** Clear in-memory ambient fallback text and any open-dialog status view. */
+    private fun clearAmbientFallbackStatus() {
+        ambientFallbackStatus = null
+        settingsAmbientStatusView?.let { tv ->
+            tv.text = ""
+            tv.visibility = View.GONE
+        }
+    }
+
+    /**
+     * User-visible wording for ambient PHOTOS/VIDEO failures.
+     * Always tells the user to select the source again; diagnostic detail stays in logs.
+     */
+    private fun userFacingAmbientFallback(reason: String): String {
+        val lower = reason.lowercase()
+        return when {
+            lower.contains("photo") ->
+                "Could not use the photo folder ($reason). Select the photo folder again."
+            lower.contains("video") ->
+                "Could not play the video ($reason). Select a video again."
+            else ->
+                "Ambient media failed ($reason). Select the source again."
+        }
+    }
+
+    private fun scheduleNightBoundary() {
+        cancelNightBoundary()
+        if (!privacyModeActive || !prefs.nightWindowEnabled) return
+
+        val cal = Calendar.getInstance()
+        val nowMinutes = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val delay =
+            NightWindow
+                .millisUntilNextBoundary(
+                    nowMinutes = nowMinutes,
+                    nowSecondsInMinute = cal.get(Calendar.SECOND),
+                    nowMillisInSecond = cal.get(Calendar.MILLISECOND),
+                    startMinutes = NightWindow.parseHhMm(prefs.nightStart),
+                    endMinutes = NightWindow.parseHhMm(prefs.nightEnd),
+                ).coerceAtLeast(1_000L)
+
+        nightBoundaryRunnable =
+            Runnable {
+                if (privacyModeActive) {
+                    applyAmbientContent()
+                }
+            }
+        nightBoundaryHandler.postDelayed(nightBoundaryRunnable!!, delay)
+        mainDiag("Night boundary scheduled in ${delay}ms")
+    }
+
+    private fun cancelNightBoundary() {
+        nightBoundaryRunnable?.let { nightBoundaryHandler.removeCallbacks(it) }
+        nightBoundaryRunnable = null
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        return try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) cursor.getString(idx) else null
+                } else {
+                    null
+                }
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -1100,6 +1574,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun cleanup() {
         try {
+            cancelNightBoundary()
+            ambientSyncServer?.stop()
+            ambientSyncServer = null
+            if (::ambientController.isInitialized) {
+                ambientController.stopAll()
+            }
             disconnect()
             videoDecoder?.release()
             videoDecoder = null

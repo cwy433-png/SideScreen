@@ -36,6 +36,7 @@ class QRScannerActivity : AppCompatActivity() {
         startCamera()
     }
 
+    @android.annotation.SuppressLint("UnsafeOptInUsageError")
     private fun startCamera() {
         val previewView = findViewById<PreviewView>(R.id.preview)
         val providerFuture = ProcessCameraProvider.getInstance(this)

@@ -144,15 +144,15 @@
             android:layout_height="24dp"
             android:layout_gravity="center"
             android:src="@drawable/ic_settings"
-            android:tint="#FFFFFF" />
+            app:tint="#FFFFFF" />
     </androidx.cardview.widget.CardView>
 
-    <!-- Privacy blackout when host display is sleeping.
+    <!-- Ambient / privacy container when host display is sleeping.
          Declared after statusBar/settingsButton (elevation 8dp) and uses
          elevation 16dp so it covers video + those chrome views, but stays
          below settingsPanel (24dp) so the connection panel remains visible
-         after disconnect. -->
-    <View
+         after disconnect. Tap opens settings (button sits under overlay). -->
+    <FrameLayout
         android:id="@+id/privacyOverlay"
         android:layout_width="0dp"
         android:layout_height="0dp"
@@ -164,7 +164,90 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <!-- CLOCK: system TextClock, muted low-brightness styling -->
+        <LinearLayout
+            android:id="@+id/ambientClock"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:visibility="gone"
+            android:clickable="false"
+            android:focusable="false">
+
+            <TextClock
+                android:id="@+id/ambientClockTime"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:format12Hour="h:mm"
+                android:format24Hour="HH:mm"
+                android:textColor="#99FFFFFF"
+                android:textSize="96sp"
+                android:fontFamily="sans-serif-thin"
+                android:includeFontPadding="false" />
+
+            <TextClock
+                android:id="@+id/ambientClockDate"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:format12Hour="EEE, MMM d"
+                android:format24Hour="EEE, MMM d"
+                android:textColor="#66FFFFFF"
+                android:textSize="22sp"
+                android:fontFamily="sans-serif-light" />
+        </LinearLayout>
+
+        <!-- PHOTOS: two stacked ImageViews for crossfade -->
+        <FrameLayout
+            android:id="@+id/ambientImage"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone"
+            android:clickable="false"
+            android:focusable="false">
+
+            <ImageView
+                android:id="@+id/ambientImageA"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:scaleType="centerCrop"
+                android:alpha="0"
+                android:contentDescription="@null" />
+
+            <ImageView
+                android:id="@+id/ambientImageB"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:scaleType="centerCrop"
+                android:alpha="0"
+                android:contentDescription="@null" />
+        </FrameLayout>
+
+        <!-- VIDEO: Media3 PlayerView, center-crop via resize_mode zoom -->
+        <androidx.media3.ui.PlayerView
+            android:id="@+id/ambientVideo"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone"
+            android:clickable="false"
+            android:focusable="false"
+            app:use_controller="false"
+            app:resize_mode="zoom"
+            app:surface_type="texture_view"
+            app:shutter_background_color="#FF000000" />
+
+        <!-- Topmost: guarantee settings remain reachable over PlayerView/images. -->
+        <View
+            android:id="@+id/ambientTapCatcher"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clickable="true"
+            android:focusable="true"
+            android:background="@android:color/transparent" />
+    </FrameLayout>
 
     <!-- Modern Connection Panel -->
     <androidx.cardview.widget.CardView
@@ -778,6 +861,8 @@
         android:id="@+id/logText"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:visibility="gone" />
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
