@@ -51,6 +51,16 @@ class ScreenCapture {
     private var frameMonitorTimer: DispatchSourceTimer?
     private var restartAttempted = false
     private var wakeObservers: [NSObjectProtocol] = []
+    /// True between startStreaming and stopStreaming. Prevents a delayed
+    /// wake-triggered restart from bringing capture back after Stop.
+    ///
+    /// Generation-guard design adapted from upstream PR #43 by @lhysilicon
+    /// (co-authored with Claude), integrated into upstream main by
+    /// @tranvuongquocdat in d7d334d.
+    private var isStreaming = false
+    /// Incremented by every stop and restart. Async work must still match the
+    /// generation that launched it before it may start capture or fallback.
+    private var streamGeneration: UInt64 = 0
     private var wakeRestartPending = false
 
     // CGDisplayStream fallback
@@ -413,6 +423,8 @@ class ScreenCapture {
         currentGamingBoost = gamingBoost
         currentFrameRate = frameRate
 
+        isStreaming = true
+
         let (width, height) = encodeSize(for: codec)
 
         encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: frameRate)
@@ -519,6 +531,13 @@ class ScreenCapture {
     // MARK: - Stream restart
 
     private func restartStream() {
+        guard isStreaming else {
+            debugLog("restartStream skipped — not streaming")
+            return
+        }
+
+        streamGeneration &+= 1
+        let generation = streamGeneration
         restartAttempted = true
         stateLock.withLock { $0.hasReceivedFirstFrame = false }
 
@@ -526,6 +545,11 @@ class ScreenCapture {
             do {
                 // Stop existing stream
                 try? await stream?.stopCapture()
+                guard isStreaming, generation == streamGeneration else {
+                    debugLog("restartStream(gen \(generation)) superseded after stopCapture — aborting")
+                    return
+                }
+
                 stream = nil
                 streamOutput = nil
                 streamDelegate = nil
@@ -534,16 +558,36 @@ class ScreenCapture {
                 // Re-setup
                 try await setupDisplay()
                 try await setupStream()
+                guard isStreaming, generation == streamGeneration else {
+                    debugLog("restartStream(gen \(generation)) superseded during setup — aborting")
+                    try? await stream?.stopCapture()
+                    stream = nil
+                    return
+                }
 
                 // Re-attach encoding pipeline using shared handler
                 configureFrameHandler(label: "restart")
+                guard isStreaming, generation == streamGeneration else {
+                    debugLog("restartStream(gen \(generation)) superseded before start — aborting")
+                    return
+                }
 
                 try await stream?.startCapture()
+                guard isStreaming, generation == streamGeneration else {
+                    debugLog("restartStream(gen \(generation)) superseded after startCapture — aborting")
+                    try? await stream?.stopCapture()
+                    return
+                }
+
                 debugLog("SCStream restarted — starting frame flow monitor")
                 startFrameMonitor()
             } catch {
                 debugLog("SCStream restart failed: \(error) — falling back to CGDisplayStream")
-                attemptFallbackCapture()
+                if isStreaming, generation == streamGeneration {
+                    attemptFallbackCapture()
+                } else {
+                    debugLog("restartStream(gen \(generation)) superseded before fallback — aborted")
+                }
             }
         }
     }
@@ -671,6 +715,10 @@ class ScreenCapture {
     // MARK: - Stop streaming
 
     func stopStreaming() {
+        // Invalidate delayed wake/stall restarts before beginning teardown.
+        isStreaming = false
+        streamGeneration &+= 1
+
         // Cancel frame flow monitor
         stopFrameMonitor()
 
