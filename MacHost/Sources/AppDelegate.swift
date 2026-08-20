@@ -60,6 +60,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
+    /// Reentrancy latch for startServer() — a second Start (double-clicked menu
+    /// item, auto-start racing a manual click) must not build a second virtual
+    /// display / server. Main-actor confined.
+    private var isStartingServer = false
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -470,6 +474,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startServer() async {
+        let canStart = await MainActor.run { () -> Bool in
+            guard !isStartingServer, !settings.isRunning else { return false }
+            isStartingServer = true
+            return true
+        }
+        guard canStart else {
+            debugLog("startServer() ignored — already starting or already running")
+            return
+        }
+        defer {
+            Task { @MainActor [weak self] in self?.isStartingServer = false }
+        }
         debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)")
         guard settings.hasScreenRecordingPermission else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
@@ -522,7 +538,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Setup capture
-            guard let displayID = virtualDisplayManager?.displayID else { return }
+            guard let displayID = virtualDisplayManager?.displayID else {
+                throw NSError(
+                    domain: "SideScreen.Startup",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "The virtual display was created without a display ID."]
+                )
+            }
             screenCapture = try await ScreenCapture()
             screenCapture?.onCaptureMethodChanged = { [weak self] method in
                 guard let self = self else { return }
@@ -615,9 +637,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.start()
+            guard let server = streamingServer else {
+                throw NSError(
+                    domain: "SideScreen.Startup",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "The streaming server could not be created."]
+                )
+            }
+            try await server.start()
             screenCapture?.startStreaming(
-                to: streamingServer,
+                to: server,
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
                 gamingBoost: settings.gamingBoost,
@@ -632,8 +661,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             print("❌ Failed to start: \(error)")
             await MainActor.run {
-                settings.isRunning = false
-                settings.displayCreated = false
+                self.tearDownServerResources(saveDisplayPosition: false)
 
                 let alert = NSAlert()
                 alert.messageText = "Failed to Start Server"
@@ -644,19 +672,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func stopServer() {
-        // Save display position before destroying
-        virtualDisplayManager?.saveDisplayPosition()
+    private func tearDownServerResources(saveDisplayPosition: Bool) {
+        if saveDisplayPosition {
+            virtualDisplayManager?.saveDisplayPosition()
+        }
 
         screenCapture?.stopStreaming()
         streamingServer?.stop()
         virtualDisplayManager?.destroyDisplay()
 
+        screenCapture = nil
+        streamingServer = nil
+        virtualDisplayManager = nil
+        currentWirelessDevice = nil
+
         settings.isRunning = false
         settings.displayCreated = false
         settings.clientConnected = false
+        settings.currentWirelessDevice = nil
         settings.currentFPS = 0
         settings.currentBitrate = 0
+    }
+
+    func stopServer() {
+        tearDownServerResources(saveDisplayPosition: true)
 
         print("⏹️ Server stopped")
     }
