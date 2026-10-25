@@ -51,16 +51,13 @@ class ScreenCapture {
     private var frameMonitorTimer: DispatchSourceTimer?
     private var restartAttempted = false
     private var wakeObservers: [NSObjectProtocol] = []
-    /// True between startStreaming and stopStreaming. Prevents a delayed
-    /// wake-triggered restart from bringing capture back after Stop.
-    ///
-    /// Generation-guard design adapted from upstream PR #43 by @lhysilicon
-    /// (co-authored with Claude), integrated into upstream main by
-    /// @tranvuongquocdat in d7d334d.
+    /// True between startStreaming and stopStreaming. Guards wake-triggered
+    /// restarts from re-enabling capture after a stop.
     private var isStreaming = false
-    /// Incremented by every stop and restart. Async work must still match the
-    /// generation that launched it before it may start capture or fallback.
+    /// Bumped on every stopStreaming and every restart so a superseded
+    /// in-flight restart Task aborts instead of resurrecting capture.
     private var streamGeneration: UInt64 = 0
+
     private var wakeRestartPending = false
 
     // CGDisplayStream fallback
@@ -139,11 +136,28 @@ class ScreenCapture {
     /// Codec for the current encode session. Switching restarts the stream.
     private(set) var codec: StreamCodec = .hevc
 
+    /// Largest frame the connected client wants to receive (issue #41): the
+    /// smaller of its panel size and what its decoder can sustain at the panel
+    /// refresh rate. Nil for legacy clients that report nothing.
+    private var clientDecodeLimit: (width: Int, height: Int)?
+    /// The same ceiling measured per frame rate (type 14), when the client sent it.
+    private var clientDecodeLimitTable: [Int: (width: Int, height: Int)]?
+
     /// Encode dimensions for a codec: physical display pixels, clamped to the
-    /// AVC decoder limit when streaming H.264. SCStream/CGDisplayStream scale
-    /// the capture into this size, so no virtual-display change is needed.
+    /// client's reported ceiling when known, else to the conservative AVC floor
+    /// when streaming H.264. SCStream/CGDisplayStream scale the capture into
+    /// this size, so no virtual-display change is needed.
+    ///
+    /// This is what makes HiDPI usable on a tablet: macOS renders at 2x, SCStream
+    /// downsamples to the client's ceiling before encode, and the client decodes
+    /// a frame it can sustain — sharper than a 1x capture of the same size.
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
         let phys = (displayWidth, displayHeight)
+        // A reported limit is authoritative for both codecs: it is what the
+        // client's own MediaCodec claims it can decode.
+        if let budget = CodecLimits.budget(limit: clientDecodeLimit, table: clientDecodeLimitTable, forFps: refreshRate) {
+            return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: budget)
+        }
         switch codec {
         case .hevc: return phys
         case .h264: return CodecLimits.clampForAvc(width: phys.0, height: phys.1)
@@ -223,7 +237,7 @@ class ScreenCapture {
     }
 
     private func handleWake() {
-        // Only act while a capture is actually running (PR #42 entry guard).
+        // Only act while a capture is actually running.
         guard stream != nil || cgDisplayStream != nil else { return }
         // A full system wake fires both screensDidWake and didWake —
         // coalesce them into a single power notify + capture restart.
@@ -329,7 +343,11 @@ class ScreenCapture {
         let (width, height) = encodeSize(for: codec)
         let fps = refreshRate
 
-        streamOutput = StreamOutput()
+        // Keep a local reference. `streamOutput` is cleared by the restart, fallback
+        // and stop paths, so force-unwrapping the property further down races with
+        // any of them and crashes setup with "Unexpectedly found nil".
+        let output = StreamOutput()
+        streamOutput = output
 
         let delegate = StreamDelegate()
         delegate.onStreamError = { [weak self] _ in
@@ -348,7 +366,14 @@ class ScreenCapture {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // Video-range (16-235) rather than full-range (0-255). VideoToolbox
+        // derives the bitstream's VUI full_range_flag from the pixel format,
+        // and several Android vendor display paths (Xiaomi/HyperOS among
+        // them) apply a limited-range YUV->RGB matrix regardless of that
+        // flag, which clips full-range highlights to white and crushes
+        // shadows (#55). Limited range is what every decoder/GPU assumes by
+        // default, so it renders identically everywhere.
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = true
         config.queueDepth = 4
         config.capturesAudio = false
@@ -356,7 +381,7 @@ class ScreenCapture {
         config.scalesToFit = false
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
-        try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
 
         stream = scStream
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
@@ -423,6 +448,9 @@ class ScreenCapture {
         currentGamingBoost = gamingBoost
         currentFrameRate = frameRate
 
+        // Unlike upstream, no display-sleep assertion here: Ambient mode and
+        // tablet privacy are triggered by the host display idle-sleeping, and
+        // the wake handling above recovers capture and the cursor afterwards.
         isStreaming = true
 
         let (width, height) = encodeSize(for: codec)
@@ -537,7 +565,7 @@ class ScreenCapture {
         }
 
         streamGeneration &+= 1
-        let generation = streamGeneration
+        let gen = streamGeneration
         restartAttempted = true
         stateLock.withLock { $0.hasReceivedFirstFrame = false }
 
@@ -545,8 +573,10 @@ class ScreenCapture {
             do {
                 // Stop existing stream
                 try? await stream?.stopCapture()
-                guard isStreaming, generation == streamGeneration else {
-                    debugLog("restartStream(gen \(generation)) superseded after stopCapture — aborting")
+                // A stopStreaming() or a newer restart superseded this one — do
+                // NOT bring capture back up (would resurrect a stopped stream).
+                guard isStreaming, gen == streamGeneration else {
+                    debugLog("restartStream(gen \(gen)) superseded after stopCapture — aborting")
                     return
                 }
 
@@ -558,8 +588,8 @@ class ScreenCapture {
                 // Re-setup
                 try await setupDisplay()
                 try await setupStream()
-                guard isStreaming, generation == streamGeneration else {
-                    debugLog("restartStream(gen \(generation)) superseded during setup — aborting")
+                guard isStreaming, gen == streamGeneration else {
+                    debugLog("restartStream(gen \(gen)) superseded during setup — aborting")
                     try? await stream?.stopCapture()
                     stream = nil
                     return
@@ -567,14 +597,14 @@ class ScreenCapture {
 
                 // Re-attach encoding pipeline using shared handler
                 configureFrameHandler(label: "restart")
-                guard isStreaming, generation == streamGeneration else {
-                    debugLog("restartStream(gen \(generation)) superseded before start — aborting")
+                guard isStreaming, gen == streamGeneration else {
+                    debugLog("restartStream(gen \(gen)) superseded before start — aborting")
                     return
                 }
 
                 try await stream?.startCapture()
-                guard isStreaming, generation == streamGeneration else {
-                    debugLog("restartStream(gen \(generation)) superseded after startCapture — aborting")
+                guard isStreaming, gen == streamGeneration else {
+                    debugLog("restartStream(gen \(gen)) superseded after startCapture — aborting")
                     try? await stream?.stopCapture()
                     return
                 }
@@ -583,10 +613,10 @@ class ScreenCapture {
                 startFrameMonitor()
             } catch {
                 debugLog("SCStream restart failed: \(error) — falling back to CGDisplayStream")
-                if isStreaming, generation == streamGeneration {
+                if isStreaming, gen == streamGeneration {
                     attemptFallbackCapture()
                 } else {
-                    debugLog("restartStream(gen \(generation)) superseded before fallback — aborted")
+                    debugLog("restartStream(gen \(gen)) superseded before fallback — aborted")
                 }
             }
         }
@@ -626,7 +656,8 @@ class ScreenCapture {
 
         debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
 
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        // Video-range to match the SCStream path (see #55 note above).
+        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
 
         // Without kCGDisplayStreamShowCursor the fallback stream never
@@ -693,16 +724,40 @@ class ScreenCapture {
     /// Note: if the CGDisplayStream fallback is active, restartStream() only
     /// rebuilds the SCStream path; the rare fallback+codec-switch combination
     /// recovers on the next fallback restart rather than immediately.
-    func setCodec(_ newCodec: StreamCodec) {
-        guard newCodec != codec else { return }
-        debugLog("Switching stream codec: \(codec) -> \(newCodec)")
+    /// Apply the per-connection negotiation result: stream codec plus the
+    /// client's reported decoder ceiling. Rebuilds the encoder mid-session
+    /// when either changes the encode setup (a codec switch, or a ceiling
+    /// that alters the encode dimensions — issue #41).
+    func negotiate(
+        codec newCodec: StreamCodec,
+        clientLimit: (width: Int, height: Int)?,
+        clientLimitTable: [Int: (width: Int, height: Int)]? = nil
+    ) {
+        let sizeBefore = encodeSize(for: codec)
+        let codecChanged = newCodec != codec
+        if codecChanged {
+            debugLog("Switching stream codec: \(codec) -> \(newCodec)")
+        }
         codec = newCodec
+        clientDecodeLimit = clientLimit
+        clientDecodeLimitTable = clientLimitTable
 
-        guard encoder != nil else { return }  // not streaming yet; startStreaming will pick it up
+        guard encoder != nil else { return }  // not streaming yet; startStreaming will pick both up
 
-        let (width, height) = encodeSize(for: newCodec)
+        let sizeAfter = encodeSize(for: newCodec)
+        guard codecChanged || sizeBefore != sizeAfter else { return }
+        if sizeBefore != sizeAfter {
+            let budget = CodecLimits.budget(limit: clientLimit, table: clientLimitTable, forFps: refreshRate)
+            let limitDesc = budget.map { "\($0.width)x\($0.height) at \(refreshRate) fps" } ?? "none"
+            debugLog("Encode size \(sizeBefore.width)x\(sizeBefore.height) -> \(sizeAfter.width)x\(sizeAfter.height) (client decoder limit: \(limitDesc))")
+        }
+        rebuildEncoder()
+    }
+
+    private func rebuildEncoder() {
+        let (width, height) = encodeSize(for: codec)
         let server = currentServer
-        let newEncoder = VideoEncoder(width: width, height: height, codec: newCodec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate)
+        let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate)
         newEncoder.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
@@ -715,7 +770,8 @@ class ScreenCapture {
     // MARK: - Stop streaming
 
     func stopStreaming() {
-        // Invalidate delayed wake/stall restarts before beginning teardown.
+        // Invalidate any in-flight restart (incl. the delayed wake restart) so
+        // it cannot resurrect capture after this stop.
         isStreaming = false
         streamGeneration &+= 1
 

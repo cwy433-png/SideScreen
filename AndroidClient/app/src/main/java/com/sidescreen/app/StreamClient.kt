@@ -1,6 +1,7 @@
 package com.sidescreen.app
 
 import android.content.Context
+import android.media.MediaFormat
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Process
@@ -21,7 +22,7 @@ import java.util.concurrent.TimeUnit
 class StreamClient(
     private val host: String,
     private val port: Int,
-    private val context: Context? = null,
+    private val context: Context,
 ) {
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
@@ -32,7 +33,10 @@ class StreamClient(
     // receive timestamp, and whether the frame can restart HEVC decoding.
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
-    var onDisplaySize: ((Int, Int, Int) -> Unit)? = null // width, height, rotation
+    var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
+
+    /** Logical desktop size behind the stream. Display only; never size the decoder from it. */
+    var onDesktopSize: ((Int, Int) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
 
     /** Invoked when the server confirms the stream codec (true = HEVC). */
@@ -129,7 +133,10 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 advertiseDisplayPowerSupport()
                 isConnected = true
@@ -158,6 +165,134 @@ class StreamClient(
     }
 
     /**
+     * Code-pairing failures (issue #35). Kept OUT of [WirelessConnectError] on
+     * purpose: these can only be thrown by [pairWithCode] and are handled in
+     * the pairing dialog, so putting them in the shared sealed class would just
+     * grow dead branches in every exhaustive `when` over connect errors.
+     */
+    sealed class PairingError(msg: String) : Exception(msg) {
+        /** The Mac rejected the typed one-time code. */
+        object CodeRejected : PairingError("Pairing code not accepted")
+
+        /** The Mac runs a version that predates code pairing. */
+        object HostTooOld : PairingError("Update Side Screen on the Mac to use code pairing")
+    }
+
+    data class PairingSuccess(val token: ByteArray, val macName: String)
+
+    /**
+     * Opens a TCP socket to host:port, bound to the active WiFi network. On some
+     * Android setups (especially LG/Android 12), an app's default outbound socket
+     * may take a route that silently drops LAN traffic; binding to the WIFI
+     * Network explicitly avoids that.
+     */
+    private fun openWirelessSocket(): Socket {
+        try {
+            val sock = Socket()
+            sock.tcpNoDelay = true
+            val cm = context.getSystemService(ConnectivityManager::class.java)
+            val wifiNetwork =
+                cm.allNetworks.firstOrNull { net ->
+                    val caps = cm.getNetworkCapabilities(net)
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                }
+            if (wifiNetwork != null) {
+                Log.i(TAG, "openWirelessSocket: binding socket to WiFi network $wifiNetwork")
+                wifiNetwork.bindSocket(sock)
+            } else {
+                Log.w(TAG, "openWirelessSocket: no WiFi network found, using default routing")
+            }
+            sock.connect(java.net.InetSocketAddress(host, port), 5000)
+            return sock
+        } catch (e: java.net.SocketTimeoutException) {
+            Log.e(TAG, "openWirelessSocket: TCP connect timeout to $host:$port (5s)")
+            throw WirelessConnectError.NetworkUnreachable
+        } catch (e: IOException) {
+            Log.e(TAG, "openWirelessSocket: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}")
+            throw WirelessConnectError.NetworkUnreachable
+        }
+    }
+
+    private fun readFully(
+        s: Socket,
+        buf: ByteArray,
+    ): Boolean {
+        var read = 0
+        try {
+            while (read < buf.size) {
+                val r = s.getInputStream().read(buf, read, buf.size - read)
+                if (r <= 0) break
+                read += r
+            }
+        } catch (e: IOException) {
+            return false
+        }
+        return read == buf.size
+    }
+
+    /**
+     * Code pairing (issue #35): send the typed one-time code, receive the real
+     * 32-byte token + Mac name, then close. The caller stores the result and
+     * reconnects through the normal [connectWireless] handshake.
+     * Throws [WirelessConnectError] or [PairingError] on failure. `use {}`
+     * guarantees the socket closes on every path, including coroutine
+     * cancellation and unexpected exceptions.
+     */
+    suspend fun pairWithCode(
+        code: String,
+        deviceName: String,
+    ): PairingSuccess =
+        withContext(Dispatchers.IO) {
+            Log.i(TAG, "pairWithCode: trying $host:$port (device=$deviceName)")
+            openWirelessSocket().use { s ->
+                // A silent listener (user typed the wrong port) must not hang
+                // the dialog forever: bound every blocking read.
+                s.soTimeout = PAIRING_READ_TIMEOUT_MS
+
+                try {
+                    s.getOutputStream().write(AuthHandshake.encodePairingRequest(code, deviceName))
+                    s.getOutputStream().flush()
+                } catch (e: IOException) {
+                    throw WirelessConnectError.NetworkUnreachable
+                }
+
+                val header = ByteArray(5)
+                if (!readFully(s, header)) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val parsed =
+                    AuthHandshake.parsePairingResponseHeader(header)
+                        ?: throw WirelessConnectError.ProtocolError
+                when (parsed) {
+                    is AuthHandshake.PairingHeader.LegacyHost -> throw PairingError.HostTooOld
+                    is AuthHandshake.PairingHeader.Pairing -> {
+                        if (parsed.status != AuthHandshake.PairingStatus.OK) {
+                            throw PairingError.CodeRejected
+                        }
+                    }
+                }
+
+                val token = ByteArray(32)
+                val nameLenBuf = ByteArray(1)
+                if (!readFully(s, token) || !readFully(s, nameLenBuf)) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val nameLen = nameLenBuf[0].toInt() and 0xFF
+                if (nameLen !in 1..64) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val nameBuf = ByteArray(nameLen)
+                if (!readFully(s, nameBuf)) {
+                    throw WirelessConnectError.ProtocolError
+                }
+                val macName = String(nameBuf, Charsets.UTF_8)
+                Log.i(TAG, "pairWithCode: token issued by $macName")
+                PairingSuccess(token, macName)
+            }
+        }
+
+    /**
      * Wireless connect: opens TCP, performs auth handshake, then resumes the existing receive loop on success.
      * Throws WirelessConnectError on any failure.
      */
@@ -167,41 +302,7 @@ class StreamClient(
     ) = withContext(Dispatchers.IO) {
         Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
-        // Force the socket onto the active WiFi network. On some Android setups
-        // (especially LG/Android 12), an app's default outbound socket may take
-        // a route that silently drops LAN traffic; binding to the WIFI Network
-        // explicitly avoids that.
-        val s =
-            try {
-                val sock = Socket()
-                sock.tcpNoDelay = true
-                val wifiNetwork =
-                    context?.let { ctx ->
-                        val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                        cm.allNetworks.firstOrNull { net ->
-                            val caps = cm.getNetworkCapabilities(net)
-                            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        }
-                    }
-                if (wifiNetwork != null) {
-                    Log.i(TAG, "connectWireless: binding socket to WiFi network $wifiNetwork")
-                    wifiNetwork.bindSocket(sock)
-                } else {
-                    Log.w(TAG, "connectWireless: no WiFi network found, using default routing")
-                }
-                sock.connect(java.net.InetSocketAddress(host, port), 5000)
-                sock
-            } catch (e: java.net.SocketTimeoutException) {
-                Log.e(TAG, "connectWireless: TCP connect timeout to $host:$port (5s)")
-                throw WirelessConnectError.NetworkUnreachable
-            } catch (e: IOException) {
-                Log.e(
-                    TAG,
-                    "connectWireless: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}",
-                )
-                throw WirelessConnectError.NetworkUnreachable
-            }
+        val s = openWirelessSocket()
         Log.i(
             TAG,
             "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
@@ -258,7 +359,10 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 advertiseDisplayPowerSupport()
                 isConnected = true
@@ -283,6 +387,14 @@ class StreamClient(
         }
     }
 
+    private fun advertiseDesktopGeometrySupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY)
+            out.flush()
+            diagLog("Advertised desktop-geometry support")
+        }
+    }
+
     private fun advertiseFrameMetadataSupport() {
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
@@ -291,12 +403,71 @@ class StreamClient(
         }
     }
 
+    /** Panel and codec the current connection advertises; fixed once per connect so every message agrees. */
+    private var panel: PanelGeometry? = null
+    private var negotiationMime: String = MediaFormat.MIMETYPE_VIDEO_HEVC
+
+    private fun prepareAdvertisements() {
+        panel = PanelGeometry.ofDefaultDisplay(context)
+        val fallback =
+            if (CodecCapabilities.hasHevcDecoder) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        negotiationMime = panel?.let { CodecCapabilities.preferredStreamMime(it.width, it.height) } ?: fallback
+    }
+
     private fun advertiseAvcOnlyIfNeeded() {
-        if (CodecCapabilities.hasHevcDecoder) return
+        if (negotiationMime != MediaFormat.MIMETYPE_VIDEO_AVC) return
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_AVC_ONLY)
             out.flush()
-            diagLog("Advertised AVC-only (no HEVC decoder on this device)")
+            val why =
+                if (CodecCapabilities.hasHevcDecoder) {
+                    "H.264 sustains a larger picture than HEVC on this device"
+                } else {
+                    "no HEVC decoder on this device"
+                }
+            diagLog("Advertised AVC-only ($why)")
+        }
+    }
+
+    private fun advertiseDecoderLimits() {
+        val mime = negotiationMime
+        // Nominal limit only as a fallback: it ignores blocks-per-second, so on most devices it is
+        // far too high to protect anything.
+        val limit =
+            panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.REFERENCE_FPS) }
+                ?: CodecCapabilities.nominalMaxDecodeSize(mime)
+                ?: return
+        val (maxW, maxH) = limit
+        if (maxW < 256 || maxH < 256) return
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
+            out.write(DecoderLimitWire.encodeSize(maxW, maxH))
+            out.flush()
+            val fps = CodecCapabilities.REFERENCE_FPS
+            diagLog("Advertised stream limit ${maxW}x$maxH at $fps fps for $mime (panel=$panel)")
+        }
+        advertiseDecoderLimitTable(mime)
+    }
+
+    /**
+     * Type 14: the sustainable size at each CodecCapabilities.TABLE_FPS rate, so the Mac can use
+     * the figure for the rate it actually streams at instead of scaling the 60 fps one (issue
+     * #78). Sent after type 11, which stays for Macs that predate this message and skip it.
+     */
+    private fun advertiseDecoderLimitTable(mime: String) {
+        val p = panel ?: return
+        val table = CodecCapabilities.streamLimitTable(mime, p.width, p.height) ?: return
+        if (table.any { (w, h) -> w < 256 || h < 256 }) return
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_DECODER_LIMIT_TABLE)
+            out.write(DecoderLimitWire.encodeTable(table))
+            out.flush()
+            val desc =
+                CodecCapabilities.TABLE_FPS.zip(table).joinToString {
+                        (fps, size) ->
+                    "${fps}fps=${size.first}x${size.second}"
+                }
+            diagLog("Advertised stream limit table $desc for $mime")
         }
     }
 
@@ -326,12 +497,16 @@ class StreamClient(
                             receiveVideoFrame(input, hasMetadata = true)
                         }
 
-                        1 -> { // Display size + rotation
+                        1 -> {
                             val width = input.readInt()
                             val height = input.readInt()
-                            val rotation = input.readInt()
-                            diagLog("Display config: ${width}x$height @ $rotation°")
-                            onDisplaySize?.invoke(width, height, rotation)
+                            val transform = input.readInt()
+                            val rotation = transform % 1000
+                            val flags = transform / 1000
+                            val flipHorizontal = flags and 1 == 1
+                            val flipVertical = flags and 2 == 2
+                            diagLog("Display config: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+                            onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
                         }
 
                         5 -> { // Pong response — measure round-trip latency
@@ -340,6 +515,13 @@ class StreamClient(
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        MESSAGE_DESKTOP_GEOMETRY -> {
+                            val dw = input.readInt()
+                            val dh = input.readInt()
+                            diagLog("Desktop geometry: ${dw}x$dh")
+                            onDesktopSize?.invoke(dw, dh)
                         }
 
                         MESSAGE_CODEC_SELECTED -> {
@@ -592,7 +774,11 @@ class StreamClient(
 
     companion object {
         private const val TAG = "StreamClient"
-        private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
+
+        // Only a desync guard — acquireBuffer allocates the real frame size, so a generous bound
+        // costs nothing. Must clear a keyframe at panel resolution and the highest offered bitrate.
+        private const val MAX_FRAME_SIZE = 32 * 1024 * 1024 // 32MB
+        private const val PAIRING_READ_TIMEOUT_MS = 10_000
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
         private const val MESSAGE_VIDEO_FRAME = 0
@@ -601,10 +787,15 @@ class StreamClient(
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
+        private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
+        private const val MESSAGE_DESKTOP_GEOMETRY = 13
+        private const val MESSAGE_CLIENT_DECODER_LIMIT_TABLE = 14
+        // Fork-only types live at 100+ so upstream's numbering never collides (see Mac WireMessage).
         /** Client→server opt-in, single byte only. */
-        private const val MESSAGE_CLIENT_SUPPORTS_DISPLAY_POWER = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_DISPLAY_POWER = 100
         /** Server→client, 1-byte payload: 1=sleeping, 0=awake. */
-        private const val MESSAGE_HOST_DISPLAY_POWER = 12
+        private const val MESSAGE_HOST_DISPLAY_POWER = 101
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

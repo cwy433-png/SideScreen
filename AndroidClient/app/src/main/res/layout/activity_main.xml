@@ -16,6 +16,16 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <TextureView
+        android:id="@+id/textureView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
     <!-- Modern Floating Status Bar (Top) -->
     <androidx.cardview.widget.CardView
         android:id="@+id/statusBar"
@@ -304,7 +314,28 @@
                 android:textColor="#999999"
                 android:textSize="14sp"
                 android:gravity="center"
-                android:layout_marginBottom="20dp" />
+                android:layout_marginBottom="6dp" />
+
+            <!-- Companion requirement: without this, the app looks broken to anyone without a Mac -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Requires a Mac running the SideScreen app"
+                android:textColor="#777777"
+                android:textSize="13sp"
+                android:gravity="center" />
+
+            <TextView
+                android:id="@+id/getMacAppLink"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:text="Get the Mac app →"
+                android:textColor="#007AFF"
+                android:textSize="13sp"
+                android:padding="8dp"
+                android:background="?attr/selectableItemBackground"
+                android:layout_marginBottom="12dp" />
 
             <!-- Mode toggle: USB / Wireless -->
             <com.google.android.material.button.MaterialButtonToggleGroup
@@ -638,6 +669,16 @@
                         app:cornerRadius="16dp"
                         app:backgroundTint="#4ade80"
                         android:textColor="#000000" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessEnterCodeButton"
+                        style="?attr/borderlessButtonStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="No camera? Enter code instead"
+                        android:textColor="#8ab4ff"
+                        android:textSize="13sp" />
                 </LinearLayout>
 
                 <!-- State 3: Connected -->
@@ -801,6 +842,16 @@
                         app:cornerRadius="16dp"
                         app:backgroundTint="#4ade80"
                         android:textColor="#000000" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessRepairEnterCodeButton"
+                        style="?attr/borderlessButtonStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Enter code instead"
+                        android:textColor="#8ab4ff"
+                        android:textSize="13sp" />
                 </LinearLayout>
 
                 <!-- State 5: Permission denied permanently -->
@@ -840,10 +891,41 @@
                         android:text="Open Settings"
                         app:cornerRadius="16dp"
                         app:backgroundTint="#007AFF" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wirelessPermDeniedEnterCodeButton"
+                        style="?attr/borderlessButtonStyle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="No camera? Enter code instead"
+                        android:textColor="#8ab4ff"
+                        android:textSize="13sp" />
                 </LinearLayout>
 
             </LinearLayout>
             <!-- ============= /WIRELESS MODE CONTENT ============= -->
+
+            <!-- Bundled recording of a real Mac + phone session, for people without a Mac -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/watchVideoButton"
+                style="?attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Watch demo video"
+                android:textColor="#8ab4ff"
+                android:textSize="14sp" />
+
+            <!-- Demo mode entry, shared by both connection modes -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/demoButton"
+                style="?attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="No Mac? Try the demo"
+                android:textColor="#8ab4ff"
+                android:textSize="14sp" />
 
             <!-- Hidden disconnect button reference (needed by code) -->
             <com.google.android.material.button.MaterialButton

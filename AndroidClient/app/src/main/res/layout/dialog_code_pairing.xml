@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="The code is shown under the QR in Side Screen on your Mac."
+        android:textColor="#99A0AF"
+        android:textSize="13sp"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Mac address"
+        android:textColor="#99A0AF"
+        android:textSize="11sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/codePairHost"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="192.168.1.24"
+        android:inputType="text"
+        android:digits="0123456789.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-"
+        android:textSize="15sp"
+        android:layout_marginBottom="12dp"
+        android:importantForAutofill="no" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Port"
+        android:textColor="#99A0AF"
+        android:textSize="11sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/codePairPort"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="8888"
+        android:inputType="number"
+        android:textSize="15sp"
+        android:layout_marginBottom="12dp"
+        android:importantForAutofill="no" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Pairing code"
+        android:textColor="#99A0AF"
+        android:textSize="11sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/codePairCode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="4729-3185"
+        android:inputType="number"
+        android:digits="0123456789- "
+        android:maxLength="10"
+        android:textSize="18sp"
+        android:letterSpacing="0.2"
+        android:gravity="center"
+        android:typeface="monospace"
+        android:importantForAutofill="no" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="With or without the dash — both work."
+        android:textColor="#7C8494"
+        android:textSize="11sp"
+        android:layout_marginTop="4dp" />
+
+    <TextView
+        android:id="@+id/codePairError"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="#FCA5A5"
+        android:textSize="12sp"
+        android:layout_marginTop="10dp"
+        android:visibility="gone" />
+</LinearLayout>

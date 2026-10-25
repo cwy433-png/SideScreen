@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
@@ -20,7 +22,9 @@ import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.TextureView
 import android.view.View
 import android.view.Window
 import android.view.WindowInsets
@@ -39,6 +43,8 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -46,8 +52,11 @@ import java.util.Calendar
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
+private const val MAC_APP_URL = "https://sidescreen.dev"
+
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
+    private lateinit var appUpdater: AppUpdater
     private val pairedHostStorage by lazy { PairedHostStorage(this) }
     private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
@@ -57,10 +66,23 @@ class MainActivity : AppCompatActivity() {
     private var ambientSyncServer: AmbientSyncServer? = null
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
+
+    /** In-flight code-pairing attempt (issue #35); cancelled when its dialog closes. */
+    private var pairingJob: Job? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
+    private var currentTextureSurface: Surface? = null
+    private var decoderUsingTextureView = false
+
+    // Logical desktop behind the stream, 0 when the Mac predates desktopGeometry.
+    // Shown next to the stream size; never used to size the decoder.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
+
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
+    private var displayFlipHorizontal = false
+    private var displayFlipVertical = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
@@ -148,6 +170,13 @@ class MainActivity : AppCompatActivity() {
                 applyAmbientContent()
             }
         }
+    // Demo mode: plays a bundled clip so the app can be tried without a Mac
+    private var demoPlayer: DemoPlayer? = null
+    private var demoActive = false
+    private var demoTouchHintShown = false
+
+    /** True while video is on screen — a real session or the demo. Drives the streaming chrome. */
+    private val isStreamingUi get() = isConnected || demoActive
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -169,6 +198,7 @@ class MainActivity : AppCompatActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        appUpdater = AppUpdater(this)
 
         ambientMediaStore = AmbientMediaStore(filesDir)
         macSyncStatusText =
@@ -285,6 +315,9 @@ class MainActivity : AppCompatActivity() {
                         permDenied = binding.wirelessPermDenied,
                         scanButton = binding.wirelessScanButton,
                         rescanButton = binding.wirelessRescanButton,
+                        enterCodeButton = binding.wirelessEnterCodeButton,
+                        repairEnterCodeButton = binding.wirelessRepairEnterCodeButton,
+                        permDeniedEnterCodeButton = binding.wirelessPermDeniedEnterCodeButton,
                         disconnectButton = binding.wirelessDisconnectButton,
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
@@ -304,6 +337,7 @@ class MainActivity : AppCompatActivity() {
                 onConnectRequested = { host, port, token, deviceName, macName ->
                     connectWireless(host, port, token, deviceName, macName)
                 },
+                onCodePairRequested = { showCodePairingDialog() },
             )
         wirelessController.bind()
         binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
@@ -425,28 +459,67 @@ class MainActivity : AppCompatActivity() {
                 ) {
                     mainDiag("surfaceChanged: ${width}x$height")
                     log("Surface changed: ${width}x$height")
-                    // Don't initialize decoder here — wait for display config
-                    // from the server so we use the correct resolution.
-                    // Store the holder so we can initialize later.
                     currentSurfaceHolder = holder
-                    // If we already have a display config (reconnect case), init now
-                    if (displayWidth > 0 && displayHeight > 0 && videoDecoder == null) {
-                        initializeDecoder(holder)
-                    }
+                    initializeDecoderForCurrentSurface()
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
                     mainDiag("surfaceDestroyed")
                     log("Surface destroyed")
-                    // Only release decoder, NOT the connection.
-                    videoDecoder?.release()
-                    videoDecoder = null
+                    if (!decoderUsingTextureView) {
+                        videoDecoder?.release()
+                        videoDecoder = null
+                    }
+                    currentSurfaceHolder = null
                 }
             },
         )
 
+        binding.textureView.surfaceTextureListener =
+            object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int,
+                ) {
+                    mainDiag("textureAvailable: ${width}x$height")
+                    currentTextureSurface = Surface(surface)
+                    initializeDecoderForCurrentSurface()
+                }
+
+                override fun onSurfaceTextureSizeChanged(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int,
+                ) {
+                    mainDiag("textureSizeChanged: ${width}x$height")
+                    applyTextureTransform()
+                }
+
+                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                    mainDiag("textureDestroyed")
+                    if (decoderUsingTextureView) {
+                        videoDecoder?.release()
+                        videoDecoder = null
+                    }
+                    currentTextureSurface?.release()
+                    currentTextureSurface = null
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+            }
+
+        if (binding.textureView.isAvailable && currentTextureSurface == null) {
+            binding.textureView.surfaceTexture?.let { currentTextureSurface = Surface(it) }
+        }
+
         binding.surfaceView.setOnTouchListener { view, event ->
-            handleTouch(view, event)
+            if (demoActive) showDemoTouchHint(event) else handleTouch(view, event)
+            true
+        }
+        binding.textureView.setOnTouchListener { view, event ->
+            if (demoActive) showDemoTouchHint(event) else handleTouch(view, event)
             true
         }
     }
@@ -489,8 +562,131 @@ class MainActivity : AppCompatActivity() {
             binding.showAdvanced.text = if (advancedVisible) "Hide Advanced Settings" else "Advanced Settings"
         }
 
+        binding.demoButton.setOnClickListener { startDemo() }
+        binding.watchVideoButton.setOnClickListener { showHowItWorksVideo() }
+        binding.getMacAppLink.setOnClickListener {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(MAC_APP_URL)))
+            } catch (_: Exception) {
+                showError("Open $MAC_APP_URL in a browser to download the Mac app.")
+            }
+        }
+
         // Initial status
         updateStatus("Ready to connect")
+    }
+
+    // ==================== Demo Mode ====================
+
+    private fun startDemo() {
+        if (demoActive || isConnected) return
+        val player =
+            try {
+                DemoPlayer(applicationContext) { videoDecoder }
+            } catch (e: Exception) {
+                mainDiag("Demo load failed: ${e.message}")
+                showError("Could not start the demo: ${e.message}")
+                return
+            }
+        mainDiag("Demo started")
+        demoActive = true
+        demoTouchHintShown = false
+        // Cancel any in-flight connection attempt (USB connect or wireless
+        // auto-reconnect) so its callbacks can't feed real frames into the demo
+        // decoder or flip the UI to "connected" mid-demo.
+        streamClient?.disconnect()
+        streamClient = null
+        videoDecoder?.release()
+        videoDecoder = null
+
+        displayWidth = DemoPlayer.WIDTH
+        displayHeight = DemoPlayer.HEIGHT
+        desktopWidth = 0
+        desktopHeight = 0
+        displayRotation = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+
+        binding.settingsPanel.visibility = View.GONE
+        applySettingsButtonVisibility()
+        restoreSettingsButtonPosition()
+        enableFullscreenMode()
+        applyRotation(0, false, false)
+        // The clip is a real 16:10 extended display: letterbox it instead of stretching
+        // UI text on phones (a real session sizes the Mac display to the tablet).
+        setSurfaceAspect("${DemoPlayer.WIDTH}:${DemoPlayer.HEIGHT}")
+        updateResolutionOverlay()
+        binding.resolutionText.append(" (demo)")
+        binding.latencyText.text = "—"
+        updateOverlayVisibility(prefs.showStatsOverlay)
+        initializeDecoderForCurrentSurface()
+
+        player.onStats = { fps, mbps ->
+            runOnUiThread {
+                binding.fpsText.text = String.format("%.1f", fps)
+                binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+            }
+        }
+        demoPlayer = player
+        player.start()
+        android.widget.Toast
+            .makeText(this, "Demo mode — open Settings (⚙) or press Back to exit", android.widget.Toast.LENGTH_LONG)
+            .show()
+    }
+
+    private fun stopDemo() {
+        if (!demoActive) return
+        mainDiag("Demo stopped")
+        demoPlayer?.stop()
+        demoPlayer = null
+        demoActive = false
+        videoDecoder?.release()
+        videoDecoder = null
+        displayWidth = 0
+        displayHeight = 0
+
+        binding.settingsButton.visibility = View.GONE
+        binding.statusBar.visibility = View.GONE
+        binding.settingsPanel.visibility = View.VISIBLE
+        setSurfaceAspect(null)
+        // Recreate the surface so the last demo frame doesn't linger behind the panel
+        binding.surfaceView.visibility = View.GONE
+        binding.surfaceView.post { binding.surfaceView.visibility = View.VISIBLE }
+        disableFullscreenMode()
+        resetOrientationToSensor()
+    }
+
+    private fun setSurfaceAspect(ratio: String?) {
+        val params = binding.surfaceView.layoutParams as ConstraintLayout.LayoutParams
+        params.dimensionRatio = ratio
+        binding.surfaceView.layoutParams = params
+    }
+
+    /** Plays the bundled recording of a real Mac + phone session, looping, full screen. */
+    private fun showHowItWorksVideo() {
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        dialog.setContentView(R.layout.dialog_how_it_works)
+        val video = dialog.findViewById<android.widget.VideoView>(R.id.howItWorksVideo)
+        video.setVideoURI(android.net.Uri.parse("android.resource://$packageName/${R.raw.how_it_works}"))
+        video.setOnPreparedListener { player ->
+            player.isLooping = true
+            video.start()
+        }
+        dialog.findViewById<View>(R.id.closeVideoButton).setOnClickListener { dialog.dismiss() }
+        dialog.setOnDismissListener { video.stopPlayback() }
+        dialog.show()
+    }
+
+    /** Touch has nothing to control in demo mode — say what it would do instead. */
+    private fun showDemoTouchHint(event: MotionEvent) {
+        if (event.actionMasked != MotionEvent.ACTION_UP || demoTouchHintShown) return
+        demoTouchHintShown = true
+        android.widget.Toast
+            .makeText(
+                this,
+                "Demo mode — when connected, touching here clicks, drags and scrolls on your Mac.",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
     }
 
     private fun showError(message: String) {
@@ -588,7 +784,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateOverlayVisibility(show: Boolean) {
-        if (streamClient != null && show) {
+        if ((streamClient != null || demoActive) && show) {
             binding.statusBar.visibility = View.VISIBLE
             // Restore position when showing
             val x = prefs.overlayX
@@ -674,6 +870,7 @@ class MainActivity : AppCompatActivity() {
         val nightWindowSwitch = view.findViewById<SwitchMaterial>(R.id.nightWindowSwitch)
         val nightStartButton = view.findViewById<MaterialButton>(R.id.nightStartButton)
         val nightEndButton = view.findViewById<MaterialButton>(R.id.nightEndButton)
+        val hideSettingsSwitch = view.findViewById<SwitchMaterial>(R.id.hideSettingsSwitch)
         val opacitySlider = view.findViewById<Slider>(R.id.opacitySlider)
         val opacityValue = view.findViewById<TextView>(R.id.opacityValue)
         val resetButton = view.findViewById<View>(R.id.resetPositionButton)
@@ -721,7 +918,8 @@ class MainActivity : AppCompatActivity() {
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
-        disconnectButton.visibility = if (isConnected) View.VISIBLE else View.GONE
+        disconnectButton.visibility = if (isStreamingUi) View.VISIBLE else View.GONE
+        if (demoActive) (disconnectButton as TextView).text = "Exit demo"
 
         // Position buttons (8 directions)
         val cornerTopLeft = view.findViewById<MaterialButton>(R.id.cornerTopLeft)
@@ -736,6 +934,7 @@ class MainActivity : AppCompatActivity() {
         // Load current settings
         showStatsSwitch.isChecked = prefs.showStatsOverlay
         allowScreenOffSwitch.isChecked = prefs.allowScreenOffOnHostSleep
+        hideSettingsSwitch.isChecked = prefs.hideSettingsButton
         opacitySlider.value = prefs.overlayOpacity
         opacityValue.text = "${(prefs.overlayOpacity * 100).toInt()}%"
         photoFolderName.text = prefs.photoTreeDisplayName ?: "None selected"
@@ -886,6 +1085,21 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        hideSettingsSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.hideSettingsButton = isChecked
+            if (isStreamingUi) {
+                applySettingsButtonVisibility()
+            }
+            if (isChecked) {
+                android.widget.Toast
+                    .makeText(
+                        this,
+                        "Settings icon hidden — use the back gesture to reveal it",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+            }
+        }
+
         opacitySlider.addOnChangeListener { _, value, _ ->
             prefs.overlayOpacity = value
             updateOverlayOpacity(value)
@@ -963,7 +1177,7 @@ class MainActivity : AppCompatActivity() {
 
         disconnectButton.setOnClickListener {
             dialog.dismiss()
-            disconnect()
+            if (demoActive) stopDemo() else disconnect()
         }
 
         closeButton.setOnClickListener {
@@ -989,6 +1203,48 @@ class MainActivity : AppCompatActivity() {
         binding.settingsButton.setOnClickListener {
             showSettingsDialog()
         }
+
+        // Escape hatch for the hidden icon: the back gesture briefly reveals it
+        // instead of leaving the app. Back is not forwarded to the Mac, so this
+        // cannot conflict with streamed touch input.
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : androidx.activity.OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (isStreamingUi && prefs.hideSettingsButton &&
+                        binding.settingsButton.visibility != View.VISIBLE
+                    ) {
+                        revealSettingsButtonTemporarily()
+                    } else if (demoActive) {
+                        stopDemo()
+                    } else {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                        isEnabled = true
+                    }
+                }
+            },
+        )
+    }
+
+    /** Streaming-time visibility of the settings icon, honoring the hide preference. */
+    private fun applySettingsButtonVisibility() {
+        binding.settingsButton.visibility =
+            if (prefs.hideSettingsButton) View.GONE else View.VISIBLE
+    }
+
+    private val revealHandler = Handler(Looper.getMainLooper())
+    private val hideSettingsButtonRunnable =
+        Runnable {
+            if (isStreamingUi && prefs.hideSettingsButton) {
+                binding.settingsButton.visibility = View.GONE
+            }
+        }
+
+    private fun revealSettingsButtonTemporarily() {
+        binding.settingsButton.visibility = View.VISIBLE
+        revealHandler.removeCallbacks(hideSettingsButtonRunnable)
+        revealHandler.postDelayed(hideSettingsButtonRunnable, 5_000L)
     }
 
     private fun restoreSettingsButtonPosition() {
@@ -1128,43 +1384,143 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun initializeDecoder(holder: SurfaceHolder) {
-        mainDiag(
-            "initializeDecoder called, surface=${holder.surface}, " +
-                "valid=${holder.surface.isValid}, res=${displayWidth}x$displayHeight",
-        )
+    /**
+     * Recreate the decoder when the negotiated stream codec doesn't match the
+     * decoder's mime. Display config and codecSelected can arrive in either
+     * order on reconnect; without this, a decoder created with the default
+     * HEVC mime keeps consuming the H.264 stream and never outputs a frame —
+     * a permanent black screen on AVC-only devices (e.g. Unisoc tablets).
+     */
+    private fun onStreamCodecSelected(isHevc: Boolean) {
+        val expectedMime =
+            if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        runOnUiThread {
+            val dec = videoDecoder
+            when {
+                dec == null -> {
+                    mainDiag("Codec selected ($expectedMime) — initializing deferred decoder")
+                    initializeDecoderForCurrentSurface()
+                }
+                dec.mime != expectedMime -> {
+                    mainDiag("Stream codec is $expectedMime but decoder is ${dec.mime} — recreating")
+                    dec.release()
+                    videoDecoder = null
+                    initializeDecoderForCurrentSurface()
+                }
+            }
+        }
+    }
+
+    /**
+     * Stream size first, since that is what the decoder and every other stat in this overlay
+     * describe. The desktop size is appended only when it differs, so a scaled HiDPI desktop is
+     * visible rather than silently standing in for the resolution actually being sent.
+     */
+    private fun updateResolutionOverlay() {
+        if (displayWidth <= 0 || displayHeight <= 0) return
+        val stream = "${displayWidth}x$displayHeight"
+        val differs = desktopWidth > 0 && (desktopWidth != displayWidth || desktopHeight != displayHeight)
+        binding.resolutionText.text =
+            if (differs) "$stream (desktop ${desktopWidth}x$desktopHeight)" else stream
+    }
+
+    private fun shouldUseTextureView(): Boolean = displayFlipHorizontal || displayFlipVertical
+
+    private fun activeVideoSurface(): Pair<Surface, Boolean>? {
+        return if (shouldUseTextureView()) {
+            currentTextureSurface?.takeIf { it.isValid }?.let { it to true }
+        } else {
+            currentSurfaceHolder?.surface?.takeIf { it.isValid }?.let { it to false }
+        }
+    }
+
+    private fun initializeDecoderForCurrentSurface() {
         if (displayWidth <= 0 || displayHeight <= 0) {
             mainDiag("initializeDecoder skipped — no display config yet")
             return
         }
+        // AVC-only device: an HEVC decoder can never decode the H.264 stream
+        // the Mac will send — defer until codecSelected arrives, then
+        // onStreamCodecSelected initializes with the correct mime.
+        if (!demoActive && !CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
+            mainDiag("initializeDecoder deferred — AVC-only device awaiting codec negotiation")
+            return
+        }
+
+        val (surface, useTextureView) =
+            activeVideoSurface() ?: run {
+                val kind = if (shouldUseTextureView()) "TextureView" else "SurfaceView"
+                mainDiag("initializeDecoder skipped — no valid $kind surface")
+                return
+            }
+
+        if (videoDecoder != null && decoderUsingTextureView == useTextureView) {
+            videoDecoder?.updateResolution(displayWidth, displayHeight)
+            return
+        }
+
+        videoDecoder?.release()
+        videoDecoder = null
+        decoderUsingTextureView = useTextureView
+
+        mainDiag(
+            "initializeDecoder called, surface=$surface, valid=${surface.isValid}, " +
+                "res=${displayWidth}x$displayHeight, texture=$useTextureView",
+        )
         try {
-            // Pass display for vsync-aligned frame presentation
-            // Use modern API on Android R+, fallback to deprecated for older versions
             val displayObj =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    display // Activity.getDisplay() - modern API
+                    display
                 } else {
                     @Suppress("DEPRECATION")
                     windowManager.defaultDisplay
                 }
             val mime =
-                if (streamClient?.streamCodecIsHevc == false) {
+                if (demoActive || streamClient?.streamCodecIsHevc == false) {
                     MediaFormat.MIMETYPE_VIDEO_AVC
                 } else {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
-            videoDecoder = VideoDecoder(holder.surface, displayObj, displayWidth, displayHeight, mime)
-            // Wire up buffer release callback
+            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime)
             videoDecoder?.onFrameDecoded = { buffer ->
                 streamClient?.releaseBuffer(buffer)
             }
             videoDecoder?.onKeyframeRequired = { force, reason ->
                 streamClient?.requestKeyframe(force = force, reason = reason)
             }
+            videoDecoder?.onDecoderStalled = {
+                // Black screen with live stats: tell the user why instead of
+                // staying silent (issue #41). Toast renders above the (black)
+                // SurfaceView; the settings panel is hidden while streaming.
+                // The sustainable size, not the decoder's advertised one — that is typically far
+                // above anything it can really output, which made this message actively misleading.
+                val panel = PanelGeometry.of(displayObj)
+                val cap =
+                    panel?.let {
+                        CodecCapabilities.maxStreamSize(
+                            mime,
+                            it.width,
+                            it.height,
+                            CodecCapabilities.REFERENCE_FPS,
+                        )
+                    }
+                runOnUiThread {
+                    val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
+                    android.widget.Toast
+                        .makeText(
+                            this,
+                            "No video output — the stream resolution may exceed " +
+                                "this tablet's decoder limit$capText. " +
+                                "Lower the resolution or refresh rate, or disable HiDPI, on the Mac.",
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                }
+            }
             streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
-            mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, videoDecoder=$videoDecoder")
+            mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
             log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${displayObj?.refreshRate ?: 60f}Hz)")
         } catch (e: Exception) {
+            decoderUsingTextureView = false
             mainDiag("Decoder init FAILED: ${e.message}")
             log("❌ Failed to initialize decoder: ${e.message}")
             runOnUiThread {
@@ -1226,7 +1582,7 @@ class MainActivity : AppCompatActivity() {
                     stopChecklistUpdates()
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
-                    binding.settingsButton.visibility = View.VISIBLE
+                    applySettingsButtonVisibility()
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
                     // For wireless mode, transition controller to CONNECTED here —
@@ -1268,30 +1624,26 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        streamClient?.onDisplaySize = { width, height, rotation ->
-            mainDiag("onDisplaySize: ${width}x$height @ $rotation°")
+        streamClient?.onDesktopSize = { w, h ->
+            desktopWidth = w
+            desktopHeight = h
+            runOnUiThread { updateResolutionOverlay() }
+        }
+
+        streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
+
+        streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+            mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
             warnIfAvcOnlyWithoutNegotiation()
             displayWidth = width
             displayHeight = height
             displayRotation = rotation
-            if (videoDecoder != null) {
-                videoDecoder?.updateResolution(width, height)
-            } else {
-                val holder = currentSurfaceHolder
-                if (holder != null && holder.surface.isValid) {
-                    mainDiag("Display config arrived, initializing decoder ${width}x$height")
-                    runOnUiThread {
-                        if (videoDecoder == null) {
-                            initializeDecoder(holder)
-                        }
-                    }
-                } else {
-                    mainDiag("Display config arrived but no valid surface yet")
-                }
-            }
+            displayFlipHorizontal = flipHorizontal
+            displayFlipVertical = flipVertical
             runOnUiThread {
-                binding.resolutionText.text = "${width}x$height"
-                applyRotation(rotation)
+                updateResolutionOverlay()
+                applyRotation(rotation, flipHorizontal, flipVertical)
+                initializeDecoderForCurrentSurface()
             }
             log("Display: ${width}x$height @ $rotation°")
         }
@@ -1478,6 +1830,118 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Code pairing (issue #35): manual host/port/code entry for tablets without
+     * a camera. On success the Mac issues the real token and we connect through
+     * the same path as a QR scan.
+     */
+    private fun showCodePairingDialog() {
+        val view = layoutInflater.inflate(R.layout.dialog_code_pairing, null)
+        val hostField = view.findViewById<android.widget.EditText>(R.id.codePairHost)
+        val portField = view.findViewById<android.widget.EditText>(R.id.codePairPort)
+        val codeField = view.findViewById<android.widget.EditText>(R.id.codePairCode)
+        val errorText = view.findViewById<android.widget.TextView>(R.id.codePairError)
+
+        // Re-pair convenience: prefill the last paired Mac so only the fresh
+        // code needs typing.
+        pairedHostStorage.load()?.let { cached ->
+            hostField.setText(cached.host)
+            portField.setText(cached.port.toString())
+        }
+
+        val dialog =
+            com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                .setTitle("Pair with code")
+                .setView(view)
+                .setPositiveButton("Pair", null) // listener installed below so it doesn't auto-dismiss
+                .setNegativeButton("Cancel", null)
+                .create()
+
+        dialog.setOnShowListener {
+            val pairButton = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+            pairButton.setOnClickListener {
+                val host = hostField.text.toString().trim()
+                val port = portField.text.toString().trim().toIntOrNull()
+                val code = codeField.text.toString().filter { it.isDigit() }
+
+                errorText.visibility = View.GONE
+                when {
+                    host.isEmpty() -> {
+                        errorText.text = "Enter the Mac's address (shown as \"Listening\" under the QR)."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                    port == null || port !in 1..65535 -> {
+                        errorText.text = "Port must be between 1 and 65535."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                    code.length != AuthHandshake.PAIR_CODE_LEN -> {
+                        errorText.text = "The code is ${AuthHandshake.PAIR_CODE_LEN} digits."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                }
+                pairButton.isEnabled = false
+                pairButton.text = "Pairing…"
+
+                fun showPairError(message: String) {
+                    runOnUiThread {
+                        pairButton.isEnabled = true
+                        pairButton.text = "Pair"
+                        errorText.text = message
+                        errorText.visibility = View.VISIBLE
+                    }
+                }
+
+                val deviceName = WirelessTabController.defaultDeviceName()
+                pairingJob =
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val client = StreamClient(host, port!!, applicationContext)
+                            val result = client.pairWithCode(code, deviceName)
+                            // Dialog dismissed mid-flight (Cancel/back): drop the
+                            // token instead of silently connecting.
+                            ensureActive()
+                            runOnUiThread {
+                                dialog.dismiss()
+                                wirelessController.onCodePairComplete(host, port, result.token, result.macName)
+                            }
+                        } catch (e: StreamClient.PairingError) {
+                            showPairError(
+                                when (e) {
+                                    is StreamClient.PairingError.CodeRejected ->
+                                        "Code not accepted. Codes change after each use — " +
+                                            "check the Mac for the current one."
+                                    is StreamClient.PairingError.HostTooOld ->
+                                        "Update Side Screen on the Mac to use code pairing."
+                                },
+                            )
+                        } catch (e: StreamClient.WirelessConnectError) {
+                            showPairError(
+                                when (e) {
+                                    is StreamClient.WirelessConnectError.NetworkUnreachable ->
+                                        "No response from $host:$port. Check both devices are " +
+                                            "on the same WiFi and the Mac app is running."
+                                    else -> "Connection error — try again."
+                                },
+                            )
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            log("Code pairing failed unexpectedly: ${e.message}")
+                            showPairError("Pairing failed — try again.")
+                        }
+                    }
+            }
+        }
+        dialog.setOnDismissListener {
+            pairingJob?.cancel()
+            pairingJob = null
+        }
+        dialog.show()
+    }
+
     private fun connectWireless(
         host: String,
         port: Int,
@@ -1485,6 +1949,7 @@ class MainActivity : AppCompatActivity() {
         deviceName: String,
         macName: String,
     ) {
+        stopDemo() // a real connection (incl. wireless auto-reconnect) takes over the decoder
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
@@ -1512,6 +1977,7 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        stopDemo()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
@@ -1553,6 +2019,14 @@ class MainActivity : AppCompatActivity() {
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
+        desktopWidth = 0
+        desktopHeight = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+        runOnUiThread {
+            binding.textureView.visibility = View.GONE
+            applyTextureTransform()
+        }
         log("Disconnected")
     }
 
@@ -1580,9 +2054,12 @@ class MainActivity : AppCompatActivity() {
             if (::ambientController.isInitialized) {
                 ambientController.stopAll()
             }
+            stopDemo()
             disconnect()
             videoDecoder?.release()
             videoDecoder = null
+            currentTextureSurface?.release()
+            currentTextureSurface = null
 
             // Release wake lock safely
             try {
@@ -1603,15 +2080,19 @@ class MainActivity : AppCompatActivity() {
         view: View,
         event: MotionEvent,
     ) {
-        val x = event.x / view.width.toFloat()
-        val y = event.y / view.height.toFloat()
+        val rawX = event.x / view.width.toFloat()
+        val rawY = event.y / view.height.toFloat()
+        val x = if (displayFlipHorizontal) 1f - rawX else rawX
+        val y = if (displayFlipVertical) 1f - rawY else rawY
         val pointerCount = event.pointerCount.coerceAtMost(2)
 
         var x2 = 0f
         var y2 = 0f
         if (pointerCount >= 2) {
-            x2 = event.getX(1) / view.width.toFloat()
-            y2 = event.getY(1) / view.height.toFloat()
+            val rawX2 = event.getX(1) / view.width.toFloat()
+            val rawY2 = event.getY(1) / view.height.toFloat()
+            x2 = if (displayFlipHorizontal) 1f - rawX2 else rawX2
+            y2 = if (displayFlipVertical) 1f - rawY2 else rawY2
         }
 
         when (event.actionMasked) {
@@ -1651,28 +2132,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Apply rotation by changing the Activity's screen orientation
-     * This provides proper fullscreen portrait/landscape support
-     */
-    private fun applyRotation(rotation: Int) {
+    private fun applyRotation(
+        rotation: Int,
+        flipHorizontal: Boolean,
+        flipVertical: Boolean,
+    ) {
         requestedOrientation =
             when (rotation) {
                 90 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
                 270 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
-                else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE // 0°
+                else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             }
 
-        // Reset SurfaceView transform (orientation change handles rotation)
-        binding.surfaceView.apply {
-            this.rotation = 0f
-            scaleX = 1f
-            scaleY = 1f
-        }
-
-        // ConstraintSet handles orientation changes automatically
-        // No need for postDelayed positioning
+        binding.surfaceView.rotation = 0f
+        binding.surfaceView.visibility = View.VISIBLE
+        binding.textureView.visibility = if (flipHorizontal || flipVertical) View.VISIBLE else View.GONE
+        applyTextureTransform()
 
         log(
             "🔄 Orientation: ${when (rotation) {
@@ -1680,8 +2156,22 @@ class MainActivity : AppCompatActivity() {
                 180 -> "Landscape (flipped)"
                 270 -> "Portrait (flipped)"
                 else -> "Landscape"
-            }}",
+            }}${if (flipHorizontal || flipVertical) " mirrored" else ""}",
         )
+    }
+
+    private fun applyTextureTransform() {
+        val view = binding.textureView
+        val matrix = Matrix()
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        matrix.postScale(
+            if (displayFlipHorizontal) -1f else 1f,
+            if (displayFlipVertical) -1f else 1f,
+            centerX,
+            centerY,
+        )
+        view.setTransform(matrix)
     }
 
     /**
@@ -1697,6 +2187,12 @@ class MainActivity : AppCompatActivity() {
             val lines = current.split("\n").takeLast(5)
             binding.logText.text = (lines + message).joinToString("\n")
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Only nudge about updates while idle — never over a live stream or the demo.
+        if (!isStreamingUi) appUpdater.checkForUpdate()
     }
 
     override fun onDestroy() {

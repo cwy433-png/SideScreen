@@ -9,20 +9,52 @@ val computedVersionCode = versionParts[0].toInt() * 10000 + versionParts[1].toIn
 
 android {
     namespace = "com.sidescreen.app"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.sidescreen.app"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = computedVersionCode
         versionName = appVersion
     }
 
+    // Release signing: reads the upload key from env vars (set as GitHub Secrets in CI,
+    // or exported locally). Falls back to the debug key when they are absent so that
+    // `./gradlew assembleRelease` keeps working on a fresh checkout.
+    val keystorePath = System.getenv("SIDESCREEN_KEYSTORE_PATH")
+    val hasReleaseKey = keystorePath != null && File(keystorePath).exists()
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = File(keystorePath!!)
+                storePassword = System.getenv("SIDESCREEN_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("SIDESCREEN_KEY_ALIAS")
+                keyPassword = System.getenv("SIDESCREEN_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
+        // Separate package so a debug build installs next to the Play Store build
+        // (different signing keys would otherwise force an uninstall).
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
-            isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            // R8: shrink + obfuscate. Play flags bundles with <25% obfuscated code
+            // (DEX optimization warning, deadline Feb 2027); also trims ~12 MB of DEX.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = if (hasReleaseKey) {
+                signingConfigs.getByName("release")
+            } else {
+                logger.warn("SIDESCREEN_KEYSTORE_PATH not set: signing release with the debug key (not suitable for Play Store).")
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
@@ -58,6 +90,8 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.media3:media3-exoplayer:1.2.1")
     implementation("androidx.media3:media3-ui:1.2.1")
+    // Flexible in-app updates for Play-installed builds (0.11.6)
+    implementation("com.google.android.play:app-update-ktx:2.1.0")
 
     testImplementation("junit:junit:4.13.2")
     // Real org.json for JVM unit tests (android.jar stubs throw "not mocked")

@@ -325,6 +325,7 @@ struct SettingsView: View {
                                             RoundedRectangle(cornerRadius: 4)
                                                 .stroke(Color.accentColor.opacity(0.5), lineWidth: 1)
                                                 .frame(width: 80, height: 50)
+                                                .scaleEffect(x: settings.flipHorizontal ? -1 : 1, y: settings.flipVertical ? -1 : 1)
                                                 .rotationEffect(.degrees(Double(settings.rotation)))
 
                                             Text(settings.rotation == 90 || settings.rotation == 270 ? "Portrait" : "Landscape")
@@ -360,6 +361,39 @@ struct SettingsView: View {
                                             .font(.system(size: 10))
                                             .foregroundColor(.accentColor)
                                     }
+
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("Flip Horizontally")
+                                                    .font(.system(size: 11))
+                                                    .foregroundColor(.secondary)
+                                                Text("Mirror left and right")
+                                                    .font(.system(size: 10))
+                                                    .foregroundColor(.secondary.opacity(0.7))
+                                            }
+                                            Spacer()
+                                            Toggle("", isOn: $settings.flipHorizontal)
+                                                .toggleStyle(.switch)
+                                                .controlSize(.mini)
+                                        }
+
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("Flip Vertically")
+                                                    .font(.system(size: 11))
+                                                    .foregroundColor(.secondary)
+                                                Text("Mirror top and bottom")
+                                                    .font(.system(size: 10))
+                                                    .foregroundColor(.secondary.opacity(0.7))
+                                            }
+                                            Spacer()
+                                            Toggle("", isOn: $settings.flipVertical)
+                                                .toggleStyle(.switch)
+                                                .controlSize(.mini)
+                                        }
+                                    }
+                                    .padding(.top, 4)
 
                                     HStack {
                                         Spacer()
@@ -405,10 +439,38 @@ struct SettingsView: View {
                                     }
                                 }
 
+                                // Custom rate (issue #41): budget tablets can be
+                                // artifact-free below a preset but not at it —
+                                // let users find their panel's sweet spot.
+                                HStack(spacing: 8) {
+                                    Text("Custom")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                    Slider(
+                                        value: Binding(
+                                            get: { Double(settings.refreshRate) },
+                                            set: {
+                                                let rate = Int($0.rounded())
+                                                // Same-value stores still fire didSet +
+                                                // UserDefaults writes — skip them.
+                                                if rate != settings.refreshRate {
+                                                    settings.refreshRate = rate
+                                                }
+                                            }
+                                        ),
+                                        in: 15...120,
+                                        step: 1
+                                    )
+                                }
+
                                 if settings.refreshRate >= 90 {
                                     Text("High refresh rate for smooth experience")
                                         .font(.system(size: 10))
                                         .foregroundColor(.green)
+                                } else if ![30, 60].contains(settings.refreshRate) {
+                                    Text("Custom rate — handy when a tablet shows artifacts above a certain FPS")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
                                 }
                             }
                         }
@@ -762,6 +824,34 @@ struct SettingsView: View {
                                             .foregroundColor(.secondary)
                                         Button(action: {
                                             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                                        }) {
+                                            HStack {
+                                                Image(systemName: "gear")
+                                                Text("Open System Settings")
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                    }
+                                    .padding(10)
+                                    .background(Color.orange.opacity(0.1))
+                                    .cornerRadius(8)
+                                }
+
+                                if !settings.displaysHaveSeparateSpaces {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "exclamationmark.triangle.fill")
+                                                .foregroundColor(.orange)
+                                            Text("Tablet goes black in fullscreen apps")
+                                                .font(.system(size: 12, weight: .medium))
+                                        }
+                                        Text("\"Displays have separate Spaces\" is turned off, so macOS blanks every other display — including the tablet — whenever an app enters fullscreen. Turn it on in System Settings → Desktop & Dock → Mission Control, then log out and back in.")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        Button(action: {
+                                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Desktop-Settings.extension")!)
                                         }) {
                                             HStack {
                                                 Image(systemName: "gear")
@@ -1138,6 +1228,12 @@ class DisplaySettings: ObservableObject {
     @Published var rotation: Int {
         didSet { save("rotation", rotation) }
     }
+    @Published var flipHorizontal: Bool {
+        didSet { save("flipHorizontal", flipHorizontal) }
+    }
+    @Published var flipVertical: Bool {
+        didSet { save("flipVertical", flipVertical) }
+    }
     @Published var showAllResolutions: Bool {
         didSet { save("showAllResolutions", showAllResolutions) }
     }
@@ -1166,8 +1262,17 @@ class DisplaySettings: ObservableObject {
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?
+    /// One-time wireless pairing code (issue #35). Non-nil only while the
+    /// server is running in wireless mode; never persisted.
+    @Published var pairingCode: String?
     @Published var hasScreenRecordingPermission = false
     @Published var hasAccessibilityPermission = false
+    /// Mirrors `NSScreen.screensHaveSeparateSpaces`. When the user has turned
+    /// off "Displays have separate Spaces", macOS blanks every other display
+    /// (including our virtual one) whenever any app goes fullscreen — the
+    /// tablet shows black while the stream keeps flowing (issue #50). The
+    /// setting only takes effect after logout, so this is a per-session fact.
+    @Published var displaysHaveSeparateSpaces = true
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
     /// Whether `adb forward` for ambient sync is present (USB mode).
@@ -1209,6 +1314,8 @@ class DisplaySettings: ObservableObject {
         // Existing users keep their saved value.
         self.port = UInt16(defaults.object(forKey: keyPrefix + "port") as? Int ?? 54321)
         self.rotation = defaults.object(forKey: keyPrefix + "rotation") as? Int ?? 0
+        self.flipHorizontal = defaults.bool(forKey: keyPrefix + "flipHorizontal")
+        self.flipVertical = defaults.bool(forKey: keyPrefix + "flipVertical")
         self.showAllResolutions = defaults.bool(forKey: keyPrefix + "showAllResolutions")
         self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
         self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
@@ -1239,7 +1346,7 @@ class DisplaySettings: ObservableObject {
 
     static let resolutionGroups: [ResolutionGroup] = [
         ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
-            "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600"
+            "1280x800", "1440x900", "1680x1050", "1920x1200", "2304x1440", "2560x1600"
         ]),
         ResolutionGroup(name: "16:9", ratio: "HD/4K", resolutions: [
             "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160"
@@ -1284,7 +1391,7 @@ class DisplaySettings: ObservableObject {
 
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
-                    "gamingBoost", "port", "rotation", "showAllResolutions",
+                    "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
                     "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode",
                     "ambientMediaSourceKind", "ambientPhotoFolderPath", "ambientVideoPath"]
         for key in keys {
@@ -1299,6 +1406,8 @@ class DisplaySettings: ObservableObject {
         gamingBoost = false
         port = 54321
         rotation = 0
+        flipHorizontal = false
+        flipVertical = false
         showAllResolutions = false
         customWidth = 1920
         customHeight = 1200
@@ -1753,6 +1862,25 @@ struct WirelessSection: View {
                     Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
+                    if let code = settings.pairingCode {
+                        HStack(spacing: 10) {
+                            VStack { Divider() }
+                            Text("No camera on your tablet?")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .fixedSize()
+                            VStack { Divider() }
+                        }
+                        .padding(.top, 8)
+                        Text(PairingCode.display(code))
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
+                            .kerning(3)
+                            .textSelection(.enabled)
+                        Text("Type this one-time code in the Android app instead.\nA new code is issued after each pairing.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 .frame(maxWidth: .infinity)
             }

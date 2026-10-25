@@ -25,6 +25,8 @@ class WirelessTabController(
         deviceName: String,
         macName: String,
     ) -> Unit,
+    /** Code pairing (issue #35): open the "enter code" dialog. */
+    private val onCodePairRequested: () -> Unit,
 ) {
     data class Views(
         val connecting: View,
@@ -35,6 +37,9 @@ class WirelessTabController(
         val permDenied: View,
         val scanButton: Button,
         val rescanButton: Button,
+        val enterCodeButton: Button,
+        val repairEnterCodeButton: Button,
+        val permDeniedEnterCodeButton: Button,
         val disconnectButton: Button,
         val forgetButton: Button,
         val reconnectButton: Button,
@@ -57,6 +62,9 @@ class WirelessTabController(
     fun bind() {
         views.scanButton.setOnClickListener { triggerScan() }
         views.rescanButton.setOnClickListener { triggerScan() }
+        views.enterCodeButton.setOnClickListener { onCodePairRequested() }
+        views.repairEnterCodeButton.setOnClickListener { onCodePairRequested() }
+        views.permDeniedEnterCodeButton.setOnClickListener { onCodePairRequested() }
         views.openSettingsButton.setOnClickListener { cameraPerm.openAppSettings() }
         views.forgetButton.setOnClickListener {
             storage.clear()
@@ -130,10 +138,26 @@ class WirelessTabController(
 
     fun onScanResult(url: String) {
         val parsed = PairingURL.parse(url) ?: return
-        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+        val deviceName = defaultDeviceName()
         storage.save(PairedHostStorage.Entry(parsed.host, parsed.port, parsed.token, parsed.macName))
         showConnecting("Connecting to ${parsed.macName}", "${parsed.host}:${parsed.port}")
         onConnectRequested(parsed.host, parsed.port, parsed.token, deviceName, parsed.macName)
+    }
+
+    /**
+     * Code pairing succeeded (issue #35): the Mac issued the real token. Save it
+     * exactly like a QR scan and connect through the normal wireless handshake.
+     */
+    fun onCodePairComplete(
+        host: String,
+        port: Int,
+        token: ByteArray,
+        macName: String,
+    ) {
+        val deviceName = defaultDeviceName()
+        storage.save(PairedHostStorage.Entry(host, port, token, macName))
+        showConnecting("Connecting to $macName", "$host:$port")
+        onConnectRequested(host, port, token, deviceName, macName)
     }
 
     fun onConnectError(error: StreamClient.WirelessConnectError) {
@@ -217,12 +241,26 @@ class WirelessTabController(
     }
 
     private fun attemptAutoConnect(entry: PairedHostStorage.Entry) {
-        val deviceName = (android.os.Build.MODEL ?: "Android").take(64)
+        val deviceName = defaultDeviceName()
         onConnectRequested(entry.host, entry.port, entry.token, deviceName, entry.macName)
     }
 
     companion object {
         const val REQ_SCAN = 1001
         const val REQ_CAMERA = 1002
+
+        /**
+         * The device name sent in handshakes. The wire format caps the name at
+         * 64 UTF-8 BYTES (not chars — a char-truncated non-ASCII model name can
+         * still overflow and fail the codec's require), and Build.MODEL can
+         * legally be blank on some devices.
+         */
+        fun defaultDeviceName(): String {
+            var name = android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
+            while (name.toByteArray(Charsets.UTF_8).size > 64) {
+                name = name.dropLast(1)
+            }
+            return name
+        }
     }
 }

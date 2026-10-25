@@ -64,6 +64,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
     private var isStartingServer = false
+    /// The effective refresh rate the running pipeline was built with — lets
+    /// the refresh-rate observer skip restarts that would change nothing.
+    private var lastAppliedRefreshRate: Int?
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -134,6 +137,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
+
+        // "Displays have separate Spaces" off → any fullscreen app blanks the
+        // virtual display (#50). Nothing we can do about it from capture side;
+        // surface it so the user knows why the tablet went black.
+        let separateSpaces = NSScreen.screensHaveSeparateSpaces
+        if separateSpaces != settings.displaysHaveSeparateSpaces {
+            settings.displaysHaveSeparateSpaces = separateSpaces
+            if !separateSpaces {
+                debugLog("WARNING: 'Displays have separate Spaces' is OFF — fullscreen apps on the Mac will blank the tablet (#50)")
+            }
+        }
 
         // While a wireless client is actively streaming, keep its lastConnected
         // rolling forward so the UI shows "just now". On disconnect, the
@@ -233,13 +247,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // Observer cho rotation changes - send to connected client immediately
-        settings.$rotation
+        Publishers.CombineLatest3(settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
             .dropFirst()
-            .sink { [weak self] rotation in
+            .sink { [weak self] rotation, flipHorizontal, flipVertical in
                 guard let self = self, self.settings.isRunning else { return }
-                print("🔄 Rotation changed to \(rotation)°")
-                self.streamingServer?.updateRotation(rotation)
+                print("🔄 Display transform changed: \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+                self.streamingServer?.updateDisplayTransform(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
             }
             .store(in: &cancellables)
 
@@ -271,31 +284,84 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] resolution in
+                self?.restartRunningServer(reason: "Resolution changed to \(resolution)")
+            }
+            .store(in: &cancellables)
+
+        // Refresh rate shapes the virtual display mode AND the capture
+        // interval, so it needs the same rebuild as a resolution change.
+        // Debounced: the custom-FPS slider (issue #41) emits continuously
+        // while dragging — restart once the value settles. The effective-rate
+        // guard skips no-op restarts (drag ends back on the applied value, or
+        // Gaming Boost is pinning the rate to 120).
+        settings.$refreshRate
+            .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .seconds(1.2), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
                 guard let self = self else { return }
                 Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
-                    self.stopServer()
-                    await self.startServer()
+                    let effective = self.settings.effectiveRefreshRate
+                    guard effective != self.lastAppliedRefreshRate else { return }
+                    self.restartRunningServer(reason: "Refresh rate changed to \(effective) Hz")
                 }
             }
             .store(in: &cancellables)
+    }
+
+    /// Stop-and-restart the server to rebuild the virtual display and capture
+    /// pipeline. No-op while stopped.
+    private func restartRunningServer(reason: String) {
+        Task { @MainActor in
+            guard self.settings.isRunning else { return }
+            debugLog("\(reason) — restarting server to rebuild virtual display")
+            self.stopServer()
+            await self.startServer()
+        }
     }
 
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Virtual Display")
+            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Side Screen")
         }
 
+        // Items are rebuilt on every open (menuNeedsUpdate) so the menu always
+        // reflects live server/connection state.
         let menu = NSMenu()
-
-        menu.addItem(NSMenuItem(title: "Settings", action: #selector(showSettings), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-
+        menu.delegate = self
+        menu.autoenablesItems = false
         statusItem?.menu = menu
+
+        // Dim the menu bar icon while the server is stopped — at-a-glance
+        // state without opening the menu.
+        settings.$isRunning
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] running in
+                self?.statusItem?.button?.appearsDisabled = !running
+            }
+            .store(in: &cancellables)
+    }
+
+    @objc private func toggleServerFromMenu() {
+        if settings.isRunning {
+            stopServer()
+        } else {
+            Task { [weak self] in
+                await self?.startServer()
+            }
+        }
+    }
+
+    @objc private func selectUSBMode() {
+        guard settings.connectionMode != .usb else { return }
+        settings.connectionMode = .usb
+    }
+
+    @objc private func selectWirelessMode() {
+        guard settings.connectionMode != .wireless else { return }
+        settings.connectionMode = .wireless
     }
 
     func setupSettingsWindow() {
@@ -553,6 +619,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.settings.captureMethod = method
                 }
             }
+            lastAppliedRefreshRate = settings.effectiveRefreshRate
             try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
 
             // Setup server
@@ -560,6 +627,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
+                configurePairingCode(on: streamingServer)
                 streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
                     guard let self = self else { return }
                     Task { @MainActor in
@@ -569,13 +637,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-            // Send the LOGICAL resolution that the user picked. The H.264 SPS in
-            // the stream still carries the true physical pixel dimensions, so the
-            // Android decoder/MediaCodec sets up correctly regardless. Sending the
-            // logical dimensions here makes the resolution overlay on Android
-            // match the Mac's resolution dropdown (e.g. "2560x1600" instead of
-            // the HiDPI-doubled "5120x3200").
-            streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation)
+            // displayConfig carries the ENCODED size, always. The client sizes and
+            // selects its decoder from it, so a friendlier number here makes it
+            // check capabilities against a resolution it will never receive. The
+            // logical desktop travels separately, for display only.
+            let initialEncode = ScreenCapture.physicalSize(for: displayID)
+            streamingServer?.setDesktopSize(width: size.width, height: size.height)
+            streamingServer?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
@@ -588,24 +656,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // dimensions for the negotiated codec.
             streamingServer?.onCodecNegotiated = { [weak self] codec in
                 guard let self = self, let capture = self.screenCapture else { return }
-                capture.setCodec(codec)
-                switch codec {
-                case .hevc:
-                    // Logical user-picked resolution, exactly as at startup.
-                    self.streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: self.settings.rotation)
-                case .h264:
-                    // Clamped physical encode size: the client must configure
-                    // its (weak) AVC decoder within its supported range, and
-                    // this matches what the stream's SPS will carry.
-                    let enc = capture.encodeSize(for: .h264)
-                    self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation)
-                }
+                capture.negotiate(
+                    codec: codec,
+                    clientLimit: self.streamingServer?.clientDecodeLimits,
+                    clientLimitTable: self.streamingServer?.clientDecodeLimitTable
+                )
+                let enc = capture.encodeSize(for: codec)
+                // Whatever the codec negotiation settled on, this is what the
+                // stream's SPS will carry, so it is what the client must size
+                // its decoder for.
+                self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
+                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
             }
             streamingServer?.onKeyframeRequested = { [weak self] force in
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
 
-            // Display sleep/wake → privacy mode on Android (gated by type 11 opt-in).
+            // Display sleep/wake → privacy mode on Android (gated by type 100 opt-in).
             screenCapture?.onDisplayPowerChanged = { [weak self] sleeping in
                 self?.streamingServer?.sendDisplayPowerState(sleeping: sleeping)
             }
@@ -672,10 +739,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Code pairing (issue #35): issue a fresh one-time code for this wireless
+    /// session. The server consumes/invalidates the code atomically on its
+    /// network queue (one-time use, 5-attempt budget); these callbacks only
+    /// install the replacement.
+    private func configurePairingCode(on server: StreamingServer?) {
+        guard let server = server else { return }
+        rotatePairingCode(on: server)
+        server.pairingMacName = Host.current().localizedName ?? "Mac"
+        server.onPairingSuccess = { [weak self, weak server] deviceName in
+            guard let self = self else { return }
+            self.rotatePairingCode(on: server)
+            Task { @MainActor in
+                self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
+            }
+        }
+        server.onPairingCodeExhausted = { [weak self, weak server] in
+            debugLog("Pairing attempt budget exhausted — rotating code")
+            self?.rotatePairingCode(on: server)
+        }
+    }
+
+    private func rotatePairingCode(on server: StreamingServer?) {
+        let code = PairingCode.generate()
+        server?.expectedPairingCode = code
+        Task { @MainActor in
+            // A rotation queued just before Stop must not resurrect the code
+            // in the UI after stopServer() cleared it.
+            guard self.settings.isRunning || self.isStartingServer else { return }
+            self.settings.pairingCode = code
+        }
+    }
+
     private func tearDownServerResources(saveDisplayPosition: Bool) {
         if saveDisplayPosition {
             virtualDisplayManager?.saveDisplayPosition()
         }
+        settings.pairingCode = nil
+        streamingServer?.expectedPairingCode = nil
 
         screenCapture?.stopStreaming()
         streamingServer?.stop()
@@ -1105,5 +1206,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+}
+
+// MARK: - Menu bar quick actions
+
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        // Live status line (not clickable)
+        let statusTitle: String
+        if settings.isRunning {
+            if settings.clientConnected {
+                let device = settings.currentWirelessDevice ?? "tablet"
+                statusTitle = "🟢 Connected — \(device)"
+            } else {
+                statusTitle = "🟡 Waiting for tablet on port \(settings.port)"
+            }
+        } else {
+            statusTitle = "⚪️ Server stopped"
+        }
+        let statusLine = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        statusLine.isEnabled = false
+        menu.addItem(statusLine)
+        menu.addItem(.separator())
+
+        // Start / Stop
+        let toggle = NSMenuItem(
+            title: settings.isRunning ? "Stop Streaming" : "Start Streaming",
+            action: #selector(toggleServerFromMenu),
+            keyEquivalent: "t"
+        )
+        toggle.target = self
+        // Mirror the settings-window Start button: starting needs the Screen
+        // Recording permission, stopping is always allowed.
+        toggle.isEnabled = settings.isRunning || settings.hasScreenRecordingPermission
+        menu.addItem(toggle)
+
+        // Connection mode (switching while running restarts the server, same
+        // as changing it in the settings window)
+        let modeMenu = NSMenu()
+        modeMenu.autoenablesItems = false
+        let usb = NSMenuItem(title: "USB", action: #selector(selectUSBMode), keyEquivalent: "")
+        usb.target = self
+        usb.state = settings.connectionMode == .usb ? .on : .off
+        modeMenu.addItem(usb)
+        let wireless = NSMenuItem(title: "Wireless", action: #selector(selectWirelessMode), keyEquivalent: "")
+        wireless.target = self
+        wireless.state = settings.connectionMode == .wireless ? .on : .off
+        modeMenu.addItem(wireless)
+        let modeItem = NSMenuItem(title: "Connection Mode", action: nil, keyEquivalent: "")
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
+
+        menu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: "s")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Side Screen", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 }

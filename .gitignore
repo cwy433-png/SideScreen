@@ -16,6 +16,7 @@ AndroidClient/.idea/
 *.dmg
 *.iml
 *.keystore
+*.jks
 
 # macOS build (main + test apps)
 **/.build/
@@ -58,3 +59,6 @@ tmp/
 temp/
 *.tmp
 .superpowers/
+
+# Local ktlint binary (CI downloads its own)
+AndroidClient/ktlint

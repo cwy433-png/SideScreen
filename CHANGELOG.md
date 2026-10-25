@@ -9,11 +9,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Android: mandatory in-app updates — a build installed from Google Play checks for a newer version whenever it is idle (never during a stream or the demo) and, if there is one, Play's full-screen update installs it and restarts the app; backing out closes the app.
+
+### Changed
+- Android: release builds are now shrunk and obfuscated with R8 (Play's DEX-optimization requirement; also cuts the install size). Crash traces stay readable via the mapping embedded in the bundle.
+
+### Fixed
+- Android: starting the demo while a connection attempt was still in progress left that attempt running in the background; it is now cancelled first.
+- Blurry picture on tablets whose stream was shrunk well below the panel (#78). The tablet now reports the size its decoder sustains at 30, 60 and 120 fps separately (new wire type 14, alongside the old single figure), and the Mac uses the entry for the rate it streams at instead of scaling the 60 fps figure — which on a 2800×1840 MatePad Air at 120 Hz turned the full panel into 1968×1280. Tablets whose H.264 decoder sustains a noticeably larger picture than their HEVC one (Honor Pad X9 and similar budget chips) now ask for H.264 at the larger size. Both apps need updating for the full effect; either side alone keeps the old behaviour.
+
+### Changed
+- Android: release builds are now signed with a dedicated upload key (from CI secrets) instead of the debug key. Previously every CI build used a fresh debug key, so updating the APK required uninstalling the old one first. The first release after this change will also need a one-time uninstall.
+- Android: `targetSdk`/`compileSdk` raised to 36 (Android 16), AGP 8.9.1, Gradle 8.13.
+- CI: release workflow also builds an `.aab` bundle for Google Play (kept as a workflow artifact, not attached to the GitHub release).
+
+### Added
+- `PRIVACY_POLICY.md` and a release guide plus listing assets under `resources/play-store/` for the Google Play submission.
+
+### Known issue — "Screen & System Audio: Required" after updating (#77, #8, #5)
+The Mac app is ad-hoc signed, so every release has a new code hash. macOS ties the Screen Recording grant to that hash: after an update the toggle in System Settings still shows SideScreen as on, but the app sees the permission as missing, the Status row stays red and Start is disabled. Removing and re-adding the entry in System Settings often does not clear it. Fix, in Terminal:
+
+```
+tccutil reset ScreenCapture com.sidescreen.app
+```
+
+Then open SideScreen and grant Screen & System Audio Recording again when macOS asks. The app does not run this itself on purpose: doing so in 0.7.0 made XProtect quarantine the binary. A permanent fix (a stable signing identity) is planned.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming
 - Multi-touch gestures
 - Stylus/pen support
+
+---
+
+<a id="0.11.5"></a>
+## [0.11.5] - 2026-10-10 — Google Play closed testing only
+
+### Added
+- Android: demo mode — "No Mac? Try the demo" on the main screen plays a recording of a real SideScreen extended display through the normal decoder, with the settings button and stats overlay, so the app can be tried without a Mac, plus "Watch demo video", a bundled recording of a real Mac + phone session. The main screen now also states the Mac requirement and links to the Mac app.
+
+### Installation
+Google Play closed-testing build only (versionCode 1105); there is no GitHub release or DMG for 0.11.5. The next GitHub release is 0.11.6.
+
+---
+
+<a id="0.11.3"></a>
+## [0.11.3] - 2026-09-07
+
+Picture-quality and black-screen release. Colours no longer wash out on tablets that ignore the stream's full-range flag (#55), the stream is bounded by what the tablet's decoder can actually sustain rather than the size it claims (#66, #41), the decoder is always configured for the frame it really receives under HiDPI, and the Mac host now waits for its TCP listener before calling itself started. Thanks to @meta-boy and @cwy433-png for the contributions.
+
+### Fixed
+- **Washed-out / over-bright picture (#55).** The Mac captured full-range (0–255) video and flagged the stream accordingly, but several Android display paths (Xiaomi/HyperOS among them) apply a limited-range matrix regardless, so light greys clipped to white and shadows crushed to black. The capture is now video-range and the bitstream is tagged BT.709 explicitly — the default every decoder and GPU assumes, so it renders identically everywhere.
+- **Black screen on tablets whose decoder overstates its limit (#66, #41 follow-up).** The tablet used to advertise the decoder's nominal `size` limit (often 8192×8192), which ignores the `blocks-per-second` budget that actually binds — so a Snapdragon 680 or a HiDPI stream could be configured fine and then never output a frame. The tablet now advertises the largest frame its decoder sustains at 60 fps, no larger than its panel; the Mac scales the stream to fit (aspect preserved, transposed for portrait) and shrinks the budget further when streaming above 60 fps. The "decoder can't keep up" message now names the sustainable size instead of the nominal one. Contributed by @meta-boy.
+- **Decoder sized from the wrong resolution under HiDPI (#41).** With HiDPI on, the Mac sent the logical resolution (e.g. 2560×1600) so the overlay matched the dropdown, while feeding the tablet the doubled stream (5120×3200) — so the tablet's capability check ran against a size it never received. The display config now always carries the encoded size; the logical desktop travels in its own message and the overlay shows both when they differ, e.g. `1712x1072 (desktop 2560x1600)`. Fully backward compatible in both directions; an older tablet simply shows the encoded size. Contributed by @meta-boy.
+- **Decoder limit that arrives late is now honoured.** On a slow link or device the tablet's capability advertisement could land after the Mac had already finished protocol startup, in which case it was recorded but ignored until the next restart. The Mac now re-negotiates and re-sends the display config immediately.
+- **Server startup lifecycle.** The Mac host used to continue setting up capture and the virtual display before its TCP listener was actually ready, so a failed or delayed bind could look "started" while the tablet got nothing. Startup now waits for the listener (with a bounded timeout), fails fast with a clear message when the port is already in use, and tears down partial resources on any failure. Contributed by @cwy433-png.
+- **Tablet goes black when an app is fullscreen on the Mac (#50).** Caused by macOS's "Displays have separate Spaces" being turned off — with it off, macOS blanks every other display, including the virtual one, whenever any app enters fullscreen. The Mac app now detects this and shows a warning in the Status panel with a shortcut to the setting; the README's Troubleshooting section documents it too.
+
+### Added
+- **2304×1440** in the 16:10 resolution list, the native panel size of several 11" tablets.
+
+### Installation
+- **macOS (Homebrew)**: `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen` (or `brew upgrade --cask sidescreen`). Requires macOS 13 (Ventura) or later.
+- **macOS (manual)**: Open `SideScreen-0.11.3-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.3-android.apk` (enable "Unknown sources" if needed).
+- **Updating from an earlier version**: if the app reports Screen & System Audio as "Required" even though System Settings shows it on, run `tccutil reset ScreenCapture com.sidescreen.app` in Terminal and grant again (see Known issue above).
+
+---
+
+<a id="0.11.2"></a>
+## [0.11.2] - 2026-08-17
+
+Sleep/wake reliability and camera-free pairing. The Mac now survives display sleep/wake without stranding the cursor or the stream (#42, #43), tablets without a camera can pair over WiFi by typing an 8-digit code instead of scanning a QR (#35), and a custom FPS slider lets budget tablets sit exactly at their artifact-free refresh rate (#41). The Mac app can also be installed via Homebrew now (#17).
+
+### Added
+- **Pair by code — no camera needed (#35).** The Mac shows an 8-digit one-time code under the wireless QR; on the tablet, "No camera? Enter code instead" opens a dialog for the Mac's address, port and code. Built for e-ink and other camera-less tablets. The code changes after every successful pairing, after 5 wrong attempts, and on every server start — it's a front door to the same pairing token the QR carries, so everything after pairing is unchanged. *Both apps must be updated to use it*: typing a code at an older Mac app shows a clear "Update Side Screen on the Mac" message, and older tablets simply keep pairing by QR.
+- **Custom FPS (#41 follow-up).** A 15–120 Hz slider joins the 30/60/90/120 presets, for tablets that are artifact-free at, say, 45 Hz but not 60. Changing the rate while streaming rebuilds the display once the slider settles; changes that wouldn't alter the effective rate (including while Gaming Boost pins it) don't restart anything.
+- **Homebrew install (#17).** `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen` — updating is a single `brew upgrade` from now on.
+
+### Fixed
+- **Cursor and capture lost after display sleep/wake (#42).** Display sleep kills the capture stream (ScreenCaptureKit error -3815), which silently degraded the session to a cursor-less fallback for the rest of its life. The capture now restarts when the screens wake and returns to the primary path; the fallback composites the cursor too. Contributed by @cwy433-png.
+- **Display idle-sleep no longer interrupts streaming (#43).** The Mac holds a display-sleep assertion for the whole streaming session, so the sleep/wake cycle that stranded the cursor can't start while streaming; wake-triggered and stall-triggered restarts are also guarded so a stale restart can never resurrect capture after Stop. Contributed by @lhysilicon.
+- **Rare crash while starting capture.** A restart, fallback or stop racing `setupStream()` could crash the Mac app with "Unexpectedly found nil". Contributed by @techkwon.
+
+### Installation
+- **macOS (Homebrew)**: `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen`. Requires macOS 13 (Ventura) or later.
+- **macOS (manual)**: Open `SideScreen-0.11.2-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.2-android.apk` (enable "Unknown sources" if needed).
+
+---
+
+<a id="0.11.1"></a>
+## [0.11.1] - 2026-07-19
+
+Safety and quality-of-life release. Fixes the headless lockout that could force a recovery boot (#39), the remaining random black screen on reconnect (#44), and black screens on tablets whose video decoder can't keep up with high resolutions (#41) — plus display flip for teleprompter setups contributed by @peterdenham (#28).
+
+### Added
+- **Horizontal/Vertical flip (#28).** Two new toggles next to Rotation on the Mac mirror the picture left↔right and/or top↕bottom — built for teleprompter rigs. Touch input is mirrored to match. Contributed by @peterdenham. *Requires updating both the Mac app and the Android app*: with an older Android app, enabling flip shows an unflipped picture and temporarily forces landscape until the tablet is updated.
+- **Decoder-aware resolution (#41).** The tablet now tells the Mac the maximum size its hardware video decoder can actually handle, and the Mac scales the stream to fit (aspect preserved). High resolutions + HiDPI no longer black-screen on budget tablets — they just stream at the largest size the device can decode. Fully backward compatible in both directions. If decoding still fails, the tablet now shows a clear message naming its decoder limit instead of staying silently black.
+- **Hide settings icon (#36).** New toggle in the tablet's streaming settings hides the floating settings button — handy for drawing and teleprompter use. Swipe back to reveal it for a few seconds.
+- **Menu bar quick actions.** The Mac menu bar icon now shows live status (stopped / waiting / connected with device name), Start/Stop Streaming, and a USB↔Wireless mode switch — no need to open the settings window. The icon dims while the server is stopped.
+
+### Fixed
+- **Headless lockout (#39, severity 0).** After using the tablet as the Mac's only screen, the app could restore the invisible virtual display as the *main* display on the next auto-start — menu bar, dock, and keyboard focus moved to a screen nobody could see, which looked like a completely dead Mac and forced a recovery boot. Three layers of protection now guarantee a physically attached display always owns the main slot: the saved main-slot position is never re-applied while a physical display is online, the invariant is re-asserted on every display-topology change (including hot-plugging a display into a running headless Mac, which now hands the main slot back immediately), and display arrangements are no longer written into WindowServer's permanent preferences.
+- **Random black screen on reconnect (#44, follow-up to #40).** Display config and codec negotiation can arrive in either order on reconnect; a decoder created with the wrong codec now recreates itself instead of silently consuming the stream forever. Contributed by @ltminh88.
+- **Start button double-trigger.** Rapid double Start (menu bar or settings window) can no longer create two virtual displays or bind the port twice.
+
+### Installation
+- **macOS**: Open `SideScreen-0.11.1-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.1-android.apk` (enable "Unknown sources" if needed).
 
 ---
 
